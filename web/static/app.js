@@ -576,10 +576,13 @@ async function renderCalendar() {
         try { await api("calendar", { new_link: true }); } catch (e) { toast(e.message); } renderCalendar();
       } }, "New link")),
     el("ol", { class: "steps" },
-      el("li", {}, "Tap ", el("b", {}, "Add to Google Calendar"), " — it copies the link and opens Google's “From URL” page. "
-        + "On the phone that page needs the desktop site: Chrome menu ⋮ → ", el("b", {}, "Desktop site"), "."),
-      el("li", {}, "Paste the link into ", el("b", {}, "URL of calendar"), " and tap ", el("b", {}, "Add calendar"), "."),
-      el("li", {}, "In the Google Calendar app: ☰ → Settings → the new calendar → switch on ", el("b", {}, "Sync"), ".")),
+      el("li", {}, el("b", {}, "Android (easiest): "), "install the free app ", el("b", {}, "ICSx⁵"),
+        " from the Play Store, then tap ", el("b", {}, "Other calendar app"), " here and confirm in ICSx⁵. "
+        + "The dates then appear in the Google Calendar app and stay up to date."),
+      el("li", {}, el("b", {}, "Google account on a computer / desktop site: "), "tap ", el("b", {}, "Add to Google Calendar"),
+        " (copies the link), then in the left sidebar next to “Other calendars” ", el("b", {}, "+"), " → ",
+        el("b", {}, "From URL"), " → paste → ", el("b", {}, "Add calendar"),
+        ". University accounts often have this switched off — then use ICSx⁵ or a private Google account.")),
     el("div", { class: "row" }, el("div", { class: "row-sub" },
       "Keep the link private: whoever has it sees your sign-ups (course names and times, nothing else). "
       + "Google Calendar refreshes subscribed calendars every few hours, so changes show up with a delay.")));
