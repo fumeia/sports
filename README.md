@@ -25,8 +25,8 @@ phone only sends commands and shows status.
   view, and you get a warning right when you sign up.
 - **Calendar subscription**: a private link (Week → Calendar subscription)
   that Google Calendar or any calendar app subscribes to: your actual
-  sign-ups (queued, signed up ✓, waiting for a spot), with skipped and
-  paused dates left out. It needs no login, so the long random link is the
+  sign-ups (queued, signed up ✓, waiting for a spot) and all upcoming dates
+  of your weekly courses, with skipped and paused dates left out. It needs no login, so the long random link is the
   key. You can switch it off or make a new one at any time. Google refreshes
   subscribed calendars only every few hours.
 - **Sunday summary**: Sunday at 19:00, one notification with next week's

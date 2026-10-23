@@ -368,7 +368,8 @@ def monday(now=None):
     return datetime(z.year, z.month, z.day, tzinfo=ZURICH) - timedelta(days=z.weekday())
 
 
-def build_week(jobs, watchers, plan_entries, starred_lessons, offer_key, alive):
+def build_week(jobs, watchers, plan_entries, starred_lessons, offer_key, alive,
+               planned_lessons=()):
     """Items for WEEKS_SHOWN weeks from this Monday: queued jobs, running
     watchers, results, and starred courses you're not signed up for."""
     start = monday()
@@ -423,6 +424,20 @@ def build_week(jobs, watchers, plan_entries, starred_lessons, offer_key, alive):
         add(lid, aware(h.get("lesson_start")), aware(h.get("lesson_end")), kind,
             title=h.get("title"), location=h.get("location"), place=h.get("place"),
             offer_key=h.get("offer_key"), url=h.get("lesson_url"), error=h.get("error"))
+    # weekly courses: dates not queued yet (queued_ids also holds skipped
+    # dates and ones that already ran, which mustn't show up as planned)
+    paused_weeks = PAUSES.load()["weeks"]
+    for l in planned_lessons:
+        key = offer_key(l)
+        e = entries.get(key)
+        if (not e or not e.get("weekly") or str(l["id"]) in have or l["cancelled"]
+                or l["id"] in e.get("queued_ids", []) or l["start"] < now
+                or week_key(l["start"]) in paused_weeks):
+            continue
+        add(l["id"], l["start"], l["end"], "planned", title=f"{l['sport_name']}: {l['title']}",
+            location=l["location"], niveau=l["niveau"], offer_key=key, url=l["url"],
+            sport_id=l["sport_id"], enroll_start=l["oe_from"].isoformat() if l["oe_from"] else None,
+            watch=bool(e.get("watch")))
     for l in starred_lessons:
         if str(l["id"]) in have or l["cancelled"]:
             continue
@@ -463,7 +478,7 @@ def is_paused(dt):
 # overlaps
 # ----------------------------------------------------------------------
 
-ACTIVE = ("queued", "enrolling", "retrying", "signed", "watching")
+ACTIVE = ("queued", "enrolling", "retrying", "signed", "watching", "planned")
 
 
 def mark_overlaps(items):
@@ -535,7 +550,8 @@ def calendar_ics(result, plan):
     """Your actual sign-ups (queued, signed up, waiting for a spot) as an
     .ics feed; skipped and paused dates simply aren't in it."""
     label = {"signed": "Signed up", "watching": "Full - waiting for a spot",
-             "enrolling": "Signing up now", "retrying": "Retrying"}
+             "enrolling": "Signing up now", "retrying": "Retrying",
+             "planned": "Every week - the bot queues it about a week before"}
     out = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//ASVZ Bot//EN", "CALSCALE:GREGORIAN",
            "METHOD:PUBLISH", "X-WR-CALNAME:ASVZ", "X-WR-TIMEZONE:Europe/Zurich",
            "REFRESH-INTERVAL;VALUE=DURATION:PT1H", "X-PUBLISHED-TTL:PT1H",

@@ -32,6 +32,7 @@ const ICON = {
 // item kind -> [status icon, css class, label]
 const KIND = {
   queued: ["clock", "q", "Queued"],
+  planned: ["retry", "q", "Every week — queued about a week before"],
   enrolling: ["bolt", "live", "Signing you up now"],
   retrying: ["retry", "warn", "Retrying after a failed attempt"],
   signed: ["check", "ok", "Signed up"],
@@ -431,6 +432,8 @@ function openSheet(it) {
   const body = $("#sheet-body");
   let status = label;
   if (it.kind === "queued" && it.enroll_start) status = `Enrollment opens ${shortDate(it.enroll_start)} (in ${countdown(it.enroll_start)})`;
+  if (it.kind === "planned") status = "Every week — the bot queues this date about a week before"
+    + (it.enroll_start ? `; enrollment opens ${shortDate(it.enroll_start)}` : "");
   if (it.kind === "signed" && it.place) status = `Signed up · place ${it.place}`;
   if ((it.kind === "failed" || it.kind === "retrying") && it.error) status = `${label}: ${it.error}`;
   if (it.kind === "starred") status = it.bookable === false ? "Starred · enrollment is closed for this date"
@@ -456,6 +459,13 @@ function openSheet(it) {
               toast(r.pending ? r.message : `Every week · ${plural(r.queued, "date")} queued`, r.pending ? 7000 : 3000); showOverlaps(r); await after(); }
         catch (e) { toast(e.message); }
       }) }, "Sign up every week"));
+  }
+  if (it.kind === "planned") {
+    actions.append(el("button", { class: "btn danger wide", onclick: (ev) => busy(ev.currentTarget, async () => {
+      if (!await confirmDialog("Skip this date?", `${it.title}\n${shortDate(it.start)}\nThe other weeks stay.`, "Skip")) return;
+      try { const r = await api("plan/skip", { key: it.offer_key, lesson_id: it.lesson_id }); toast(r.message, r.pending ? 7000 : 3000); await after(); }
+      catch (e) { toast(e.message); }
+    }) }, "Skip this date"));
   }
   if (it.job_id != null && ["queued", "retrying", "enrolling"].includes(it.kind)) {
     if (it.offer_key && state.plan && state.plan.entries.some((e) => e.key === it.offer_key)) {
@@ -541,6 +551,9 @@ async function renderCalendar() {
   try { c = await api("calendar"); } catch { return; }
   const url = c.url || location.origin + c.path;
   const webcal = url.replace(/^https?:/, "webcal:");
+  // Google gets the https link itself: with webcal:// it would fetch plain
+  // http and run into the redirect to https.
+  const google = "https://calendar.google.com/calendar/r?cid=" + encodeURIComponent(url);
   const box = $("#calendar");
   const on = el("input", { type: "checkbox", class: "switch", "aria-label": "Calendar link" });
   on.checked = c.enabled;
@@ -554,7 +567,7 @@ async function renderCalendar() {
   box.append(
     el("div", { class: "inline-form" }, el("span", { class: "topic" }, url), copy),
     el("div", { class: "inline-form" },
-      el("a", { class: "btn primary", href: "https://calendar.google.com/calendar/r?cid=" + encodeURIComponent(webcal),
+      el("a", { class: "btn primary", href: google,
         target: "_blank", rel: "noopener noreferrer" }, "Add to Google Calendar"),
       el("a", { class: "btn", href: webcal }, "Other calendar app"),
       el("button", { class: "btn ghost", onclick: async () => {

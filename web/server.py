@@ -376,8 +376,10 @@ def background_loop():
 
 def week_result(starred=True):
     data = helper("read")
-    return week.build_week(data["jobs"], data["watchers"], plan.load_plan()["entries"],
-                           starred_lessons() if starred else [], plan.offer_key, pid_alive)
+    entries = plan.load_plan()["entries"]
+    return week.build_week(data["jobs"], data["watchers"], entries,
+                           starred_lessons() if starred else [], plan.offer_key, pid_alive,
+                           planned_lessons(entries))
 
 
 def monitor_loop():
@@ -392,20 +394,30 @@ def monitor_loop():
         time.sleep(MONITOR_SECONDS)
 
 
-def starred_lessons():
-    """Upcoming lessons of the starred courses (from the cached ASVZ data)."""
-    favs = week.FAVS.load()["offers"]
+def lessons_of(keys):
+    """Published lessons of the given courses (offer keys), from the cached ASVZ data."""
     out = []
-    for sport_id in {m.get("sport_id") for m in favs.values() if m.get("sport_id")}:
+    for sport_id in {k.split("|", 1)[0] for k in keys}:
         try:
             offers = get_offers(sport_id)
         except Exception as e:
-            log.warning(f"Starred: couldn't load sport {sport_id}: {e}")
+            log.warning(f"Couldn't load sport {sport_id}: {e}")
             continue
         for o in offers:
-            if o["key"] in favs:
+            if o["key"] in keys:
                 out += o["lessons"]
     return out
+
+
+def starred_lessons():
+    return lessons_of(set(week.FAVS.load()["offers"]))
+
+
+def planned_lessons(entries):
+    """All published dates of your weekly courses — most aren't queued yet
+    (that happens about a week ahead), but they belong in the week view
+    and the calendar."""
+    return lessons_of({e["key"] for e in entries if e.get("weekly")})
 
 
 def health(t=None):
@@ -976,6 +988,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if applied and n:
             kick_scheduler()
         return self._changed(applied, f"{n} new date(s) queued" if n else "")
+
+    def api_post_plan_skip(self, b):
+        """Skip one future date of a weekly course before it's queued."""
+        key, lid = str(b.get("key", "")), str(b.get("lesson_id", ""))
+
+        def go():
+            with plan.schedule_lock():
+                p = plan.load_plan()
+                e = next((e for e in p["entries"] if e["key"] == key), None)
+                if not e:
+                    raise ApiError(404, "Course not in your plan")
+                if lid.isdigit() and int(lid) not in e.setdefault("queued_ids", []):
+                    e["queued_ids"].append(int(lid))  # sync never queues it now
+                plan.save_plan(p)
+        applied, _ = change("Skip a date", go)
+        return self._changed(applied, "Date skipped")
 
     def api_post_plan_remove(self, b):
         key = str(b.get("key", ""))

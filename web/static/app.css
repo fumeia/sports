@@ -210,6 +210,8 @@ main { flex: 1; min-height: 0; position: relative; }
 .block .bt { flex: 1; min-width: 0; }
 .block .bt .n { font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .block .bt .p { font-size: 0.82em; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.block.planned { background: color-mix(in srgb, var(--c) 7%, var(--surface)); }
+.block.planned::before { opacity: 0.55; }
 .block.starred { background: transparent; box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--c) 55%, transparent); }
 .block.starred::before { opacity: 0.35; }
 .block.starred .bt .n { color: var(--dim); }
