@@ -61,12 +61,21 @@ chown -R 5984:5984 "$DIR/data"          # the uid CouchDB runs as in its image
 (cd "$DIR" && docker compose config -q) || die "docker compose rejected the config."
 (cd "$DIR" && docker compose up -d 2>&1 | tail -2)
 
-info "Waiting for CouchDB…"
-for _ in $(seq 1 60); do
+info "Waiting for CouchDB (up to 2 minutes)…"
+for _ in $(seq 1 120); do
   curl -fsS -u "admin:$PW" http://127.0.0.1:5984/_up >/dev/null 2>&1 && break
   sleep 1
 done
-curl -fsS -u "admin:$PW" http://127.0.0.1:5984/_up >/dev/null || die "CouchDB didn't start: cd $DIR && docker compose logs --tail 40"
+if ! curl -fsS -u "admin:$PW" http://127.0.0.1:5984/_up >/dev/null 2>&1; then
+  echo "--- container state:"
+  docker inspect livesync-couchdb --format \
+    'status={{.State.Status}} exit={{.State.ExitCode}} restarts={{.RestartCount}} oom={{.State.OOMKilled}} error={{.State.Error}}' 2>&1
+  echo "--- container log (last 40 lines):"
+  docker logs --tail 40 livesync-couchdb 2>&1 | sed -E 's/(PASSWORD=)[^ ]+/\1***/g'
+  echo "--- what answers on 127.0.0.1:5984:"
+  curl -sS -m 5 http://127.0.0.1:5984/ 2>&1 | head -3
+  die "CouchDB didn't answer. Paste the lines above to Claude."
+fi
 ok "CouchDB running on 127.0.0.1:5984"
 
 cdb() { curl -sS -u "admin:$PW" -H 'Content-Type: application/json' "$@"; }
