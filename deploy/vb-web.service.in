@@ -1,0 +1,31 @@
+# Installed by deploy/setup.sh — the phone page + API (127.0.0.1 only;
+# Caddy adds HTTPS). Runs as user vb, which can't open the bot folder; bot
+# actions go through /usr/local/sbin/vb-bot-helper (sudo rule).
+[Unit]
+Description=vb: phone remote for the ASVZ bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=vb
+Group=vb
+WorkingDirectory=@APP_DIR@/web
+Environment=VB_BOT_DIR=@BOT_DIR@
+Environment=VB_DATA_DIR=@DATA_DIR@
+Environment=VB_PORT=@PORT@
+Environment=VB_SCHEDULER_SCRIPT=@SCHEDULER_SCRIPT@
+Environment=VB_TIMER_UNIT=@TIMER_UNIT@
+Environment=VB_PUBLIC_URL=https://@DOMAIN@
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 @APP_DIR@/web/server.py
+Restart=on-failure
+RestartSec=3
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=multi-user.target
