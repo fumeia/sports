@@ -551,9 +551,9 @@ async function renderCalendar() {
   try { c = await api("calendar"); } catch { return; }
   const url = c.url || location.origin + c.path;
   const webcal = url.replace(/^https?:/, "webcal:");
-  // Google gets the https link itself: with webcal:// it would fetch plain
-  // http and run into the redirect to https.
-  const google = "https://calendar.google.com/calendar/r?cid=" + encodeURIComponent(url);
+  // Google's quick-add link (?cid=...) says "added" but never fetches an
+  // external feed. Its "From URL" settings page does: copy the link, open it.
+  const google = "https://calendar.google.com/calendar/r/settings/addbyurl";
   const box = $("#calendar");
   const on = el("input", { type: "checkbox", class: "switch", "aria-label": "Calendar link" });
   on.checked = c.enabled;
@@ -567,13 +567,19 @@ async function renderCalendar() {
   box.append(
     el("div", { class: "inline-form" }, el("span", { class: "topic" }, url), copy),
     el("div", { class: "inline-form" },
-      el("a", { class: "btn primary", href: google,
-        target: "_blank", rel: "noopener noreferrer" }, "Add to Google Calendar"),
+      el("a", { class: "btn primary", href: google, target: "_blank", rel: "noopener noreferrer",
+        onclick: () => { navigator.clipboard?.writeText(url).then(() => toast("Link copied — paste it in Google's “URL of calendar” field", 8000), () => {}); } },
+        "Add to Google Calendar"),
       el("a", { class: "btn", href: webcal }, "Other calendar app"),
       el("button", { class: "btn ghost", onclick: async () => {
         if (!await confirmDialog("New link?", "The old link stops working. Subscribe again with the new one.", "New link", false)) return;
         try { await api("calendar", { new_link: true }); } catch (e) { toast(e.message); } renderCalendar();
       } }, "New link")),
+    el("ol", { class: "steps" },
+      el("li", {}, "Tap ", el("b", {}, "Add to Google Calendar"), " — it copies the link and opens Google's “From URL” page. "
+        + "On the phone that page needs the desktop site: Chrome menu ⋮ → ", el("b", {}, "Desktop site"), "."),
+      el("li", {}, "Paste the link into ", el("b", {}, "URL of calendar"), " and tap ", el("b", {}, "Add calendar"), "."),
+      el("li", {}, "In the Google Calendar app: ☰ → Settings → the new calendar → switch on ", el("b", {}, "Sync"), ".")),
     el("div", { class: "row" }, el("div", { class: "row-sub" },
       "Keep the link private: whoever has it sees your sign-ups (course names and times, nothing else). "
       + "Google Calendar refreshes subscribed calendars every few hours, so changes show up with a delay.")));

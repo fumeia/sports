@@ -16,8 +16,8 @@ URL="https://$SAVED_DOMAIN/cal/$TOK.ics"
 T="$(mktemp)"; trap 'rm -f "$T"' EXIT
 
 echo
-echo "===== Fetch through https://$SAVED_DOMAIN (like Google)"
-curl -sS -A "Google-Calendar-Importer" -o "$T" -w 'HTTP %{http_code}, %{size_download} bytes, %{time_total}s, type %{content_type}\n' "$URL" 2>&1 | mask
+echo "===== Fetch through https://$SAVED_DOMAIN (the way Google does; shows up in the log as vb-check-calendar)"
+curl -sS -A "vb-check-calendar" -o "$T" -w 'HTTP %{http_code}, %{size_download} bytes, %{time_total}s, type %{content_type}\n' "$URL" 2>&1 | mask
 echo "events in the feed: $(grep -c 'BEGIN:VEVENT' "$T")"
 echo "next events:"
 python3 - "$T" <<'PY'
