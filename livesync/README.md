@@ -47,8 +47,13 @@ reachable only through Caddy (HTTPS). Changes arrive within seconds.
    **Username**, **Password** and **Database** (`vault`). Test the
    connection.
 3. **The first device** (yours, the one that already has your notes)
-   sends its notes to the server. **Every other device** fetches from the
-   server. The plugin asks which it is.
+   sends its notes to the server. That step ("Rebuild everything") deletes
+   and recreates the vault on the server, which only `admin` may do: use
+   the admin login for it, then switch the plugin back to your own login,
+   and run `bash /opt/vb/livesync/setup.sh` once on the server, since the
+   recreated vault has forgotten who may use it. **Every other device**
+   fetches from the server with its own login. Never "rebuild" there: it
+   would replace the shared notes with that device's.
 4. Leave the plugin's options for syncing settings, plugins and hidden
    files **off**, so nobody's plugins end up on anyone else's device.
 5. End-to-end encryption is optional (the server is yours). If you switch
