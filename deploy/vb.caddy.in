@@ -1,0 +1,10 @@
+# Installed by deploy/setup.sh — phone remote for the ASVZ bot.
+# The page has its own login; Caddy only adds HTTPS.
+@DOMAIN@ {
+	encode gzip
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+	reverse_proxy 127.0.0.1:@PORT@
+}

@@ -1,0 +1,10 @@
+# Installed by deploy/setup.sh
+[Unit]
+Description=ASVZ bot: check for due jobs every 2 minutes
+
+[Timer]
+OnCalendar=*:0/2
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ASVZ Bot</title>
+<meta name="description" content="Remote control for the ASVZ enrollment bot on your server">
+<meta name="theme-color" content="#ebebeb" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#2e2e32" media="(prefers-color-scheme: dark)">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+
+<!-- login -->
+<section id="login" class="login" hidden>
+  <form id="login-form" class="login-card" autocomplete="on">
+    <img src="icon.svg" alt="" class="login-icon">
+    <h1>ASVZ Bot</h1>
+    <p class="dim">Remote for the bot on your server</p>
+    <div class="boxed-list">
+      <label class="row entry"><span class="row-title">Login name</span>
+        <input name="user" autocomplete="username" autocapitalize="none" required></label>
+      <label class="row entry"><span class="row-title">Password</span>
+        <input name="password" type="password" autocomplete="current-password" required></label>
+    </div>
+    <p id="login-error" class="error-text" role="alert"></p>
+    <button class="btn suggested pill wide" type="submit">Log in</button>
+  </form>
+</section>
+
+<!-- main window -->
+<div id="app" class="window" hidden>
+  <header class="headerbar">
+    <button id="back" class="btn flat icon" aria-label="Back" hidden>
+      <svg viewBox="0 0 16 16"><path d="M10.5 2.5 5 8l5.5 5.5" /></svg></button>
+    <div class="title">
+      <div class="title-main">ASVZ Bot</div>
+      <div id="subtitle" class="title-sub"></div>
+    </div>
+    <nav class="switcher wide" id="switcher-top"></nav>
+    <button id="menu-btn" class="btn flat icon" aria-label="Menu" aria-haspopup="menu">
+      <svg viewBox="0 0 16 16"><path d="M2.5 4h11M2.5 8h11M2.5 12h11" /></svg></button>
+    <div id="menu" class="popover" role="menu" hidden>
+      <button role="menuitem" data-action="reload">Reload</button>
+      <button role="menuitem" data-action="logout">Log out</button>
+      <button role="menuitem" data-action="about">About ASVZ Bot</button>
+    </div>
+  </header>
+
+  <div id="banner" class="banner" hidden>
+    <span>Background checks are off: no sign-ups happen until you turn them on.</span>
+    <button class="btn pill" id="banner-on">Turn on</button>
+  </div>
+
+  <main id="pages">
+    <!-- Discover -->
+    <section class="page" id="page-discover">
+      <div class="split">
+        <aside class="sidebar" id="sports-pane">
+          <input type="search" id="sport-search" class="search" placeholder="Search sports">
+          <div id="sports-state" class="status-page small" hidden></div>
+          <ul id="sport-list" class="nav-list"></ul>
+        </aside>
+        <div class="content" id="offers-pane">
+          <div class="filters">
+            <div class="linked" id="days"></div>
+            <select id="f-time" aria-label="Time of day"></select>
+            <select id="f-place" aria-label="Location"><option value="">All locations</option></select>
+            <select id="f-level" aria-label="Level"><option value="">All levels</option></select>
+            <select id="f-sport" aria-label="Sport" hidden><option value="">All sports</option></select>
+            <input type="search" id="f-text" class="search" placeholder="Title, sport or trainer">
+            <button class="btn flat icon" id="offers-reload" aria-label="Reload from ASVZ">
+              <svg viewBox="0 0 16 16"><path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5v2.5h-2.5" /></svg></button>
+          </div>
+          <div id="summary" class="caption dim"></div>
+          <div id="offers-state" class="status-page"></div>
+          <div id="offer-list" class="list-wrap"></div>
+        </div>
+      </div>
+      <div class="actionbar" id="selection-bar" hidden>
+        <div class="ab-row">
+          <strong id="sel-label">0 offers selected</strong>
+          <button class="btn flat" id="sel-clear">Clear</button>
+        </div>
+        <div class="ab-row">
+          <label class="switch-label" title="On: sign up for every date of these offers, including dates ASVZ publishes later. Off: only the next date.">
+            Every week <input type="checkbox" class="switch" id="sel-weekly" checked></label>
+          <label class="switch-label" title="If a date is booked out, keep checking and take a place as soon as one frees up (until the lesson starts).">
+            If full, wait for a spot <input type="checkbox" class="switch" id="sel-watch" checked></label>
+        </div>
+        <div class="ab-row end">
+          <button class="btn pill" id="sel-ics">Calendar file…</button>
+          <button class="btn pill suggested" id="sel-signup">Sign me up</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- My plan -->
+    <section class="page prefs" id="page-plan" hidden>
+      <div class="prefs-inner" id="plan-body"></div>
+    </section>
+
+    <!-- Activity -->
+    <section class="page prefs" id="page-activity" hidden>
+      <div class="prefs-inner">
+        <div class="group">
+          <div class="group-head"><h2>Status</h2></div>
+          <div class="boxed-list">
+            <label class="row">
+              <div class="row-text"><div class="row-title">Background checks</div>
+                <div class="row-sub">Server timer: processes due sign-ups every 2 minutes, phone or no phone</div></div>
+              <input type="checkbox" class="switch" id="act-timer">
+            </label>
+            <div class="row">
+              <div class="row-text"><div class="row-title">Login</div>
+                <div class="row-sub" id="act-login">…</div></div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-title">Run due sign-ups now</div>
+                <div class="row-sub">Normally not needed — happens automatically</div></div>
+              <button class="btn" id="act-run">Run</button>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-title">Server</div>
+                <div class="row-sub" id="act-server">…</div></div>
+            </div>
+          </div>
+        </div>
+        <div class="group">
+          <div class="group-head"><div><h2>Log</h2></div>
+            <button class="btn flat icon" id="log-reload" aria-label="Reload log">
+              <svg viewBox="0 0 16 16"><path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5v2.5h-2.5" /></svg></button></div>
+          <pre class="log-view" id="log-view">…</pre>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <nav class="switcher bar" id="switcher-bottom"></nav>
+</div>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<div id="dialog" class="dialog-backdrop" hidden>
+  <div class="dialog" role="alertdialog" aria-modal="true">
+    <h3 id="dialog-title"></h3>
+    <p id="dialog-body"></p>
+    <div class="dialog-buttons">
+      <button class="btn" id="dialog-cancel">Cancel</button>
+      <button class="btn" id="dialog-ok">OK</button>
+    </div>
+  </div>
+</div>
+</body>
+</html>

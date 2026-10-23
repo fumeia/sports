@@ -1,0 +1,20 @@
+# Installed by deploy/setup.sh — the ASVZ bot's "every 2 minutes" check,
+# the same command the desktop app's timer runs. Not the web page.
+[Unit]
+Description=ASVZ bot: process due enrollment jobs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=@BOT_USER@
+WorkingDirectory=@BOT_DIR@
+@CHROME_ENV@
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@BOT_PYTHON@ @BOT_DIR@/asvz_scheduler.py run
+# Detached free-spot watchers must survive the end of this run.
+KillMode=process
+@WATCHER_ENV@
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=asvz-scheduler
