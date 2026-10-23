@@ -29,6 +29,13 @@ phone only sends commands and shows status.
   of your weekly courses, with skipped and paused dates left out. It needs no login, so the long random link is the
   key. You can switch it off or make a new one at any time. Google refreshes
   subscribed calendars only every few hours.
+- **Calendar entries** carry the trainer and level, a link that opens the
+  app at that training ("Manage in ASVZ Bot"), and a link to the lesson on
+  schalter.asvz.ch (to deregister there).
+- **Reminders** one day and one hour before each training you're signed up
+  or queued for, as phone notifications with "Open in app" and "ASVZ
+  Schalter" buttons (Google ignores reminders inside subscribed calendars;
+  the feed has them too, for other calendar apps).
 - **Sunday summary**: Sunday at 19:00, one notification with next week's
   sign-ups (or "paused").
 - **Phone notifications** via the free ntfy app: signed up, full → watching,

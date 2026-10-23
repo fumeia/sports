@@ -225,7 +225,11 @@ EVENT_TEXT = {  # type -> (title, tags, priority)
     "health_bad": ("The bot isn't running", "rotating_light", 5),
     "health_ok": ("The bot runs again", "white_check_mark", 3),
     "summary": ("Your week ahead", "calendar", 3),
+    "remind_day": ("Tomorrow", "calendar", 3),
+    "remind_hour": ("In 1 hour", "alarm_clock", 4),
 }
+REMIND_KINDS = ("signed", "queued", "enrolling", "retrying", "watching")
+REMIND_SECONDS = 60
 SUMMARY_HOUR = 19          # Sunday, Zurich time
 DEFAULT_EVENTS = {k: True for k in EVENT_TEXT}
 
@@ -244,7 +248,7 @@ def notify_settings():
     return n
 
 
-def send(title, message, tags="", priority=3, click=None, force=False):
+def send(title, message, tags="", priority=3, click=None, force=False, actions=None):
     n = notify_settings()
     if not n["enabled"] and not force:
         return False
@@ -253,6 +257,8 @@ def send(title, message, tags="", priority=3, click=None, force=False):
         body["tags"] = [tags]
     if click:
         body["click"] = click
+    if actions:  # ntfy buttons: [{"action": "view", "label": ..., "url": ...}]
+        body["actions"] = actions
     req = urllib.request.Request(n["server"].rstrip("/") + "/", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"}, method="POST")
     try:
@@ -268,8 +274,9 @@ def notify_event(ev, public_url=None):
     if not n["enabled"] or not n["events"].get(ev["type"], True):
         return
     title, tags, prio = EVENT_TEXT[ev["type"]]
-    if ev.get("message"):  # events that bring their own text (summary)
-        send(title, ev["message"], tags, prio, click=public_url)
+    if ev.get("message"):  # events that bring their own text (summary, reminders)
+        send(ev.get("title") or title, ev["message"], tags, prio,
+             click=ev.get("click") or public_url, actions=ev.get("actions"))
         return
     h = HISTORY.load()["lessons"].get(ev.get("lesson_id") or "", {})
     what = h.get("title") or (f"Lesson {ev['lesson_id']}" if ev.get("lesson_id") else "")
@@ -348,6 +355,12 @@ def monitor_once(read, read_log, runs_from_journal, timer_status, public_url=Non
             new_events.append(ev)
     for k in ("radar", "radar_at"):  # state of the removed free-spot radar
         state.pop(k, None)
+    if week_fn and time.time() - state.get("remind_at", 0) >= REMIND_SECONDS:
+        state["remind_at"] = time.time()
+        try:
+            new_events += reminders(state, week_fn()["items"], public_url)
+        except Exception as e:
+            log.warning(f"Reminders: {e}")
     state.setdefault("last_run", 0)   # marks the quiet first pass as done
     with MONITOR.lock:   # merge: remember_jobs() may have added jobs meanwhile
         merged = {**jobs_seen, **MONITOR.load().get("jobs_seen", {})}
@@ -554,7 +567,19 @@ def calendar_settings():
     return c
 
 
-def calendar_ics(result, plan):
+def app_link(public_url, lesson_id):
+    """Opens the installed app (or the page) at this training's details."""
+    return f"{(public_url or '').rstrip('/')}/#lesson={lesson_id}"
+
+
+def schalter_link(lesson_id):
+    return f"https://schalter.asvz.ch/tn/lessons/{lesson_id}"
+
+
+ALARMS = (("P1D", "Tomorrow"), ("PT1H", "In 1 hour"))
+
+
+def calendar_ics(result, plan, public_url=None):
     """Your actual sign-ups (queued, signed up, waiting for a spot) as an
     .ics feed; skipped and paused dates simply aren't in it."""
     label = {"signed": "Signed up", "watching": "Full - waiting for a spot",
@@ -572,10 +597,62 @@ def calendar_ics(result, plan):
         if i["kind"] == "signed" and i.get("place"):
             status += f", place {i['place']}"
         mark = "✓ " if i["kind"] == "signed" else ""
-        description = "\n".join([status] + [f"{k}: {i[f]}" for k, f in
-                                             (("Trainer", "instructor"), ("Level", "niveau")) if i.get(f)])
-        out += plan._event(f"lesson-{i['lesson_id']}@asvz-bot", f"{mark}ASVZ {title}",
-                           plan._ics_dt(i["start"]), plan._ics_dt(i["end"]),
-                           i.get("location") or "", description, i["url"])
+        description = "\n".join(
+            [status] + [f"{k}: {i[f]}" for k, f in (("Trainer", "instructor"), ("Level", "niveau")) if i.get(f)]
+            + ["", f"Manage in ASVZ Bot: {app_link(public_url, i['lesson_id'])}",
+               f"ASVZ Schalter (deregister here): {schalter_link(i['lesson_id'])}"])
+        ev = plan._event(f"lesson-{i['lesson_id']}@asvz-bot", f"{mark}ASVZ {title}",
+                         plan._ics_dt(i["start"]), plan._ics_dt(i["end"]),
+                         i.get("location") or "", description, schalter_link(i["lesson_id"]))
+        # Reminders for apps that use them (Google ignores alarms in subscribed
+        # calendars; the bot's notifications cover that)
+        alarms = []
+        for trigger, text in ALARMS:
+            alarms += ["BEGIN:VALARM", "ACTION:DISPLAY", f"TRIGGER:-{trigger}",
+                       f"DESCRIPTION:{plan._esc(text + ': ASVZ ' + title)}", "END:VALARM"]
+        out += ev[:-1] + alarms + ev[-1:]
     out.append("END:VCALENDAR")
     return "\r\n".join(plan._fold(line) for line in out) + "\r\n"
+
+
+# ----------------------------------------------------------------------
+# reminders: one day and one hour before each training you're going to
+# ----------------------------------------------------------------------
+
+def reminders(state, items, public_url):
+    """Due reminders (each sent once). A day reminder that's late (the
+    server was off) is still sent up to 2 hours before the start; an hour
+    reminder until the start."""
+    now = datetime.now().astimezone()
+    sent = state.setdefault("reminded", {})
+    events = []
+    for i in items:
+        if i["kind"] not in REMIND_KINDS:
+            continue
+        start = aware(i["start"])
+        title = i.get("title") or f"Lesson {i['lesson_id']}"
+        for kind, before, until in (("remind_day", timedelta(days=1), timedelta(hours=2)),
+                                    ("remind_hour", timedelta(hours=1), timedelta(0))):
+            key = f"{i['lesson_id']}:{kind}"
+            if key in sent or not (start - before <= now < start - until):
+                continue
+            sent[key] = start.isoformat()
+            status = {"signed": "signed up" + (f", place {i['place']}" if i.get("place") else ""),
+                      "watching": "still full - the bot is waiting for a spot"}.get(i["kind"], "the bot signs you up")
+            z = start.astimezone(ZURICH)
+            day = "Today" if z.date() == now.astimezone(ZURICH).date() else "Tomorrow"
+            when = f"{day if kind == 'remind_day' else 'In 1 hour'} {z:%H:%M}"
+            msg = " · ".join(p for p in (title, i.get("location"),
+                                         f"Trainer: {i['instructor']}" if i.get("instructor") else None,
+                                         status) if p)
+            events.append({"type": kind, "t": int(time.time() * 1000), "lesson_id": i["lesson_id"],
+                           "title": f"{when}: {title}", "message": msg,
+                           "click": app_link(public_url, i["lesson_id"]) if public_url else None,
+                           "actions": ([{"action": "view", "label": "Open in app",
+                                         "url": app_link(public_url, i["lesson_id"])}] if public_url else [])
+                           + [{"action": "view", "label": "ASVZ Schalter",
+                               "url": schalter_link(i["lesson_id"])}]})
+    # forget reminders of lessons that are over
+    for k in [k for k, v in sent.items() if (aware(v) or now) < now - timedelta(days=1)]:
+        del sent[k]
+    return events

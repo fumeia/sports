@@ -197,7 +197,26 @@ async function boot() {
   }
   $("#login").hidden = true; $("#app").hidden = false;
   startApp();
+  openDeepLink();
 }
+
+// https://<page>/#lesson=123 (from a calendar entry or a reminder): show
+// that training's week and open its details.
+async function openDeepLink() {
+  const m = location.hash.match(/^#lesson=(\d+)$/);
+  if (!m) return;
+  history.replaceState(null, "", location.pathname);
+  setPage("week");
+  await loadWeek();
+  const it = state.week && state.week.items.find((i) => i.lesson_id === m[1]);
+  if (!it) { toast("That training isn't in the next weeks anymore."); return; }
+  for (let i = 0; i < state.week.weeks; i++) {
+    if (weekDays(i).some((d) => d.key === dayKey(it.start))) { state.weekIdx = i; break; }
+  }
+  renderWeek();
+  openSheet(it);
+}
+window.addEventListener("hashchange", () => { if (started) openDeepLink(); });
 
 $("#login-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();

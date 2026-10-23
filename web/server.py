@@ -388,7 +388,7 @@ def monitor_loop():
         try:
             week.monitor_once(lambda: helper("read"), lambda: helper("log", "400"),
                               runs_from_journal, timer_status, PUBLIC_URL,
-                              week_fn=week_result)
+                              week_fn=lambda: week_result(starred=False))
         except Exception:
             log.exception("Monitor")
         time.sleep(MONITOR_SECONDS)
@@ -1206,7 +1206,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         token = path[len("/cal/"):-len(".ics")] if path.endswith(".ics") else ""
         if not c.get("enabled") or not hmac.compare_digest(token.encode(), c["token"].encode()):
             raise ApiError(404, "Not found")
-        body = week.calendar_ics(week_result(starred=False), plan)
+        base = PUBLIC_URL or f"http://{self.headers.get('Host', f'127.0.0.1:{PORT}')}"
+        body = week.calendar_ics(week_result(starred=False), plan, base)
         log.info(f"Calendar feed fetched by {self.headers.get('User-Agent', '?')[:80]!r}: "
                  f"{body.count('BEGIN:VEVENT')} events")
         self.send(200, body, "text/calendar; charset=utf-8",
@@ -1217,7 +1218,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return {"enabled": n["enabled"], "server": n["server"], "topic": n["topic"],
                 "events": n["events"],
                 "labels": {**{k: v[0] for k, v in week.EVENT_TEXT.items()},
-                           "summary": f"Sunday summary at {week.SUMMARY_HOUR}:00: your sign-ups for the week ahead"}}
+                           "summary": f"Sunday summary at {week.SUMMARY_HOUR}:00: your sign-ups for the week ahead",
+                           "remind_day": "Reminder one day before each training",
+                           "remind_hour": "Reminder one hour before each training"}}
 
     def api_post_notify(self, b):
         def go(n):
