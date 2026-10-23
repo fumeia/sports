@@ -1,0 +1,15 @@
+# Installed by livesync/setup.sh into /opt/livesync — CouchDB for Obsidian LiveSync.
+# Port only on 127.0.0.1: reachable from outside only through Caddy (HTTPS).
+services:
+  couchdb:
+    image: couchdb:3.4
+    container_name: livesync-couchdb
+    restart: unless-stopped
+    environment:
+      COUCHDB_USER: admin
+      COUCHDB_PASSWORD: ${COUCHDB_PASSWORD}
+    volumes:
+      - ./data:/opt/couchdb/data
+      - ./local.ini:/opt/couchdb/etc/local.d/livesync.ini:ro
+    ports:
+      - "127.0.0.1:5984:5984"

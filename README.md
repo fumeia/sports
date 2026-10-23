@@ -202,3 +202,7 @@ Open http://127.0.0.1:8710, log in as `test` / `test-password-123`. It uses
 made-up lessons, a stub `asvz_bot.py` that only writes `enrolled.log`, and a
 stand-in scheduler with the same file handling as the server's
 (`VB_TEST_SCHEDULER=/path/to/asvz_scheduler.py` uses a real one instead).
+
+## Also in this repo
+
+- `livesync/`: a shared Obsidian vault for you and collaborators (Self-hosted LiveSync on your server). See `livesync/README.md`.
