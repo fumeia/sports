@@ -61,7 +61,9 @@ before; nothing new there.)
 | `deploy/inspect.sh` | **Read-only** look at how the bot runs on the server. |
 | `deploy/setup.sh` | Install / re-apply (backs up the bot folder first, changes nothing in it). |
 | `deploy/update.sh` | `git pull` + re-apply. |
-| `deploy/rollback.sh` | Remove vb again (stop page, take it out of Caddy). |
+| `deploy/rollback.sh` | Remove vb again (stop the page; tells you which Caddy line to remove). |
+| `deploy/disable-unused.sh` | Turn off the unused torrent/media tools (`--undo` turns them back on). |
+| `deploy/compare-scheduler.sh` | Read-only: the server scheduler vs. the release version. |
 | `deploy/asvz-login.sh` | Only if the bot has no saved login: writes `.asvz-bot.json`. |
 | `tests/` | Fake bot, stand-in scheduler and fake ASVZ data, to try the page without a server. |
 
@@ -91,7 +93,16 @@ for your domain and a password for the page.
 bash /opt/vb/deploy/setup.sh
 ```
 
-**6. Phone:** open `https://vb.<your domain>` in Chrome, log in, then
+**6. Server:** add `import /etc/caddy/vb.caddy` to `/etc/caddy/Caddyfile`
+yourself (next to your other import lines), then check and reload:
+```
+caddy validate --config /etc/caddy/Caddyfile
+```
+```
+systemctl reload caddy
+```
+
+**7. Phone:** open `https://vb.<your domain>` in Chrome, log in, then
 ⋮ menu → **Add to Home screen** (or **Install app**).
 
 ## Everyday
@@ -120,9 +131,11 @@ bash /opt/vb/deploy/setup.sh
   text menu). If the bot's timer is a system unit and that owner isn't root,
   a sudo rule allows exactly start/enable/disable of that timer.
 - `/var/lib/vb/`: page login, sessions, weekly plan.
-- `/etc/caddy/vb.caddy` plus one `import` line in the Caddyfile (backed up).
-  It runs `caddy validate` before the reload; if validation fails, the old
-  config is put back.
+- `/etc/caddy/vb.caddy`: the site block for `vb.<domain>`. **Your Caddyfile
+  is not edited.** At the end, setup prints the line to add yourself
+  (`import /etc/caddy/vb.caddy`) and the `caddy validate` / `systemctl reload
+  caddy` commands. Once that import exists, later updates validate before
+  reloading, and put the old `vb.caddy` back if validation fails.
 
 ## Try it without a server
 

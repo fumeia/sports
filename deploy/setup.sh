@@ -12,7 +12,8 @@
 #   1. finds the bot folder, its venv, its scheduler script and its timer
 #   2. backs up the bot folder's code + data  -> /var/backups/vb/
 #   3. installs vb-web.service on 127.0.0.1 (runs as the bot's user)
-#   4. installs /etc/caddy/vb.caddy, runs caddy validate, reloads Caddy
+#   4. writes /etc/caddy/vb.caddy (your Caddyfile is not edited: you add
+#      the import line yourself; setup prints it)
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -237,30 +238,29 @@ curl -fsS "http://127.0.0.1:$PORT/api/me" >/dev/null || die "vb-web did not star
 ok "vb-web running on 127.0.0.1:$PORT"
 
 # ---------------------------------------------------------------- 4. Caddy
+# Only our own file /etc/caddy/vb.caddy is written. The Caddyfile is never
+# edited: you add the import line yourself (printed at the end).
 CADDYFILE=/etc/caddy/Caddyfile
 [ -f "$CADDYFILE" ] || die "$CADDYFILE not found"
+IMPORTED=0
+grep -qE '^\s*import\s+(/etc/caddy/)?(vb\.caddy|\*\.caddy)\s*$' "$CADDYFILE" && IMPORTED=1
 tmp="$(mktemp)"; render "$APP_DIR/deploy/vb.caddy.in" > "$tmp"
-caddy_changed=0
-cp -p "$CADDYFILE" "$BACKUP_ROOT/Caddyfile.$TS"
 [ -f /etc/caddy/vb.caddy ] && cp -p /etc/caddy/vb.caddy "$BACKUP_ROOT/vb.caddy.$TS"
-if put "$tmp" /etc/caddy/vb.caddy; then caddy_changed=1; fi
-if ! grep -qE '^\s*import\s+(/etc/caddy/)?(vb\.caddy|\*\.caddy)\s*$' "$CADDYFILE"; then
-  printf '\nimport /etc/caddy/vb.caddy\n' >> "$CADDYFILE"
-  caddy_changed=1
-fi
-if [ "$caddy_changed" -eq 1 ]; then
-  if caddy validate --config "$CADDYFILE" --adapter caddyfile >/tmp/vb-caddy-validate.log 2>&1; then
-    systemctl reload caddy
-    ok "Caddy validated and reloaded (backup: $BACKUP_ROOT/Caddyfile.$TS)"
-  else
-    cp -p "$BACKUP_ROOT/Caddyfile.$TS" "$CADDYFILE"
-    if [ -f "$BACKUP_ROOT/vb.caddy.$TS" ]; then cp -p "$BACKUP_ROOT/vb.caddy.$TS" /etc/caddy/vb.caddy
-    else mv /etc/caddy/vb.caddy "$BACKUP_ROOT/vb.caddy.rejected.$TS"; fi
-    tail -20 /tmp/vb-caddy-validate.log
-    die "caddy validate failed — Caddy config put back as it was. Send the lines above to Claude."
+if put "$tmp" /etc/caddy/vb.caddy; then
+  ok "Wrote /etc/caddy/vb.caddy"
+  if [ "$IMPORTED" -eq 1 ]; then
+    # Already in use: check the new version before Caddy loads it.
+    if caddy validate --config "$CADDYFILE" --adapter caddyfile >/tmp/vb-caddy-validate.log 2>&1; then
+      systemctl reload caddy
+      ok "Caddy validated and reloaded"
+    else
+      if [ -f "$BACKUP_ROOT/vb.caddy.$TS" ]; then cp -p "$BACKUP_ROOT/vb.caddy.$TS" /etc/caddy/vb.caddy; fi
+      tail -20 /tmp/vb-caddy-validate.log
+      die "caddy validate failed — /etc/caddy/vb.caddy put back as it was, Caddy not reloaded. Send the lines above to Claude."
+    fi
   fi
 else
-  ok "Caddy config unchanged"
+  ok "/etc/caddy/vb.caddy unchanged"
 fi
 
 # ---------------------------------------------------------------- done
@@ -273,6 +273,14 @@ elif [[ " $mine " != *" $ip "* ]]; then
   warn "$DOMAIN points to $ip, which isn't this server ($mine). Fix the A record at Spaceship."
 else
   ok "$DOMAIN points to this server"
+fi
+if [ "$IMPORTED" -eq 0 ]; then
+  echo
+  info "Last step, in Caddy (setup doesn't edit your Caddyfile):"
+  echo "  1. add this line to $CADDYFILE, next to your other import lines:"
+  echo "       import /etc/caddy/vb.caddy"
+  echo "  2. caddy validate --config $CADDYFILE"
+  echo "  3. systemctl reload caddy"
 fi
 echo
 echo "  Open https://$DOMAIN on your phone, log in, then browser menu -> 'Add to Home screen'."
