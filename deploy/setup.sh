@@ -58,6 +58,18 @@ PORT="${PORT:-${SAVED_PORT:-8710}}"
 
 # ---------------------------------------------------------------- 1. find the bot
 if [ -z "$BOT_DIR" ]; then
+  # Prefer the folder the bot's timer actually runs in (copies of the bot
+  # elsewhere, e.g. an export/ folder, are then ignored).
+  for svc in /etc/systemd/system/*.service /root/.config/systemd/user/*.service \
+             /home/*/.config/systemd/user/*.service; do
+    [ -f "$svc" ] && [ -f "${svc%.service}.timer" ] || continue
+    grep -qE 'asvz[_-]scheduler\.py' "$svc" || continue
+    wd="$(sed -n 's/^WorkingDirectory=-\{0,1\}//p' "$svc" | head -1 | tr -d '"')"
+    [ -z "$wd" ] && wd="$(dirname "$(grep -oE '[^ "]*asvz[_-]scheduler\.py' "$svc" | head -1)")"
+    if [ -f "$wd/asvz_bot.py" ]; then BOT_DIR="$wd"; info "Bot folder taken from $svc"; break; fi
+  done
+fi
+if [ -z "$BOT_DIR" ]; then
   info "Looking for the bot folder…"
   mapfile -t cands < <(find / -xdev -name asvz_bot.py -not -path '*/venv/*' -not -path '*/.venv/*' \
                          -not -path "$APP_DIR/*" -not -path '/proc/*' -not -path "$BACKUP_ROOT/*" 2>/dev/null \
