@@ -93,10 +93,13 @@ _bookable = plan.bookable
 
 def _bookable_soon(lessons, now=None):
     """Like asvz_plan.bookable, but only dates whose enrollment opens
-    within QUEUE_DAYS. Later dates get queued by a later sync."""
+    within QUEUE_DAYS (later dates get queued by a later sync), and none
+    in a paused week."""
     horizon = (now or datetime.now().astimezone()) + timedelta(days=QUEUE_DAYS)
+    paused = week.PAUSES.load()["weeks"]
     return [l for l in _bookable(lessons, now)
-            if (l["oe_from"] or l["start"] - timedelta(days=1)) <= horizon]
+            if (l["oe_from"] or l["start"] - timedelta(days=1)) <= horizon
+            and week.week_key(l["start"]) not in paused]
 
 
 plan.bookable = _bookable_soon
@@ -371,12 +374,30 @@ def background_loop():
             log.exception("Background loop")
 
 
+def week_result(starred=True):
+    data = helper("read")
+    return week.build_week(data["jobs"], data["watchers"], plan.load_plan()["entries"],
+                           starred_lessons() if starred else [], plan.offer_key, pid_alive)
+
+
+def radar_lessons():
+    """Fresh free-place counts of the starred courses (one ASVZ request per sport)."""
+    favs = week.FAVS.load()["offers"]
+    out = []
+    for sport_id in {m.get("sport_id") for m in favs.values() if m.get("sport_id")}:
+        for o in get_offers(sport_id, force=True):
+            if o["key"] in favs:
+                out += o["lessons"]
+    return out
+
+
 def monitor_loop():
     """Results + notifications from the bot's log (see week.py)."""
     while True:
         try:
             week.monitor_once(lambda: helper("read"), lambda: helper("log", "400"),
-                              runs_from_journal, timer_status, PUBLIC_URL)
+                              runs_from_journal, timer_status, PUBLIC_URL,
+                              week_fn=week_result, radar_fn=radar_lessons)
         except Exception:
             log.exception("Monitor")
         time.sleep(MONITOR_SECONDS)
@@ -767,6 +788,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = url.path
         query = dict(urllib.parse.parse_qsl(url.query))
         try:
+            if path.startswith("/cal/") and method == "GET":
+                return self.calendar_feed(path)
             if not path.startswith("/api/"):
                 if method != "GET":
                     raise ApiError(405, "Method not allowed")
@@ -921,7 +944,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "message": BUSY_TEXT}
         count, messages = result
         kick_scheduler()
-        return {"offers": len(offers), "queued": count, "messages": messages}
+        return {"offers": len(offers), "queued": count, "messages": messages,
+                "overlaps": self._overlaps(offer_keys={o["key"] for o in offers})}
+
+    def _overlaps(self, offer_keys=(), lesson_ids=()):
+        try:
+            return week.overlap_messages(week_result(starred=False)["items"], offer_keys, lesson_ids)
+        except Exception as e:  # a warning must never break the sign-up itself
+            log.warning(f"Overlap check failed: {e}")
+            return []
 
     def api_post_ics(self, b):
         if b.get("plan"):
@@ -1014,9 +1045,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # ---- week, favourites, notifications (week.py)
     def api_get_week(self, q):
-        data = helper("read")
-        result = week.build_week(data["jobs"], data["watchers"], plan.load_plan()["entries"],
-                                 starred_lessons(), plan.offer_key, pid_alive)
+        result = week_result()
         result.update(health=health(), pending=[label for label, _ in PENDING],
                       server_time=datetime.now().astimezone().isoformat(timespec="seconds"))
         return result
@@ -1066,12 +1095,107 @@ class Handler(http.server.BaseHTTPRequestHandler):
         applied, n = change(f"Sign up: {offer['title']} {week.short(lesson['start'])}", go)
         if applied:
             kick_scheduler()
-        return self._changed(applied, "Queued" if n else "Already queued")
+        r = self._changed(applied, "Queued" if n else "Already queued")
+        r["overlaps"] = self._overlaps(lesson_ids={lid}) if applied else []
+        return r
+
+    def api_post_pause(self, b):
+        """Pause / resume one week (its Monday as YYYY-MM-DD)."""
+        key = str(b.get("week", ""))
+        try:
+            mon = datetime.fromisoformat(key).replace(tzinfo=week.ZURICH)
+        except ValueError:
+            raise ApiError(400, "Bad week")
+        if mon.weekday() != 0:
+            raise ApiError(400, "Bad week")
+        end, on = mon + timedelta(weeks=1), bool(b.get("on"))
+
+        def in_week(j):
+            s = week.aware(j.get("lesson_start"))
+            return s is not None and mon <= s < end
+
+        def pause():
+            with plan.schedule_lock():
+                jobs = plan.load_schedule()
+                now = datetime.now()
+                out = [j for j in jobs if in_week(j) and datetime.fromisoformat(j["run_at"]) > now]
+                plan.save_schedule([j for j in jobs if j not in out])
+                p = plan.load_plan()
+                gone = {str(j["lesson_id"]) for j in out}
+                for e in p["entries"]:
+                    e["dates"] = [d for d in e.get("dates", []) if str(d["lesson_id"]) not in gone]
+                plan.save_plan(p)
+            week.PAUSES.update(lambda d: d["weeks"].__setitem__(key, {"removed": out}))
+            return len(out)
+
+        def resume():
+            rec = week.PAUSES.update(lambda d: d["weeks"].pop(key, None)) or {}
+            removed = rec.get("removed", [])
+            with plan.schedule_lock():
+                # weekly courses: let the next sync queue these dates again
+                p = plan.load_plan()
+                lids = {str(j["lesson_id"]) for j in removed}
+                for e in p["entries"]:
+                    e["queued_ids"] = [x for x in e.get("queued_ids", []) if str(x) not in lids]
+                p.pop("last_sync", None)
+                plan.save_plan(p)
+                # jobs from the text menu: put them back if they're still ahead
+                jobs = plan.load_schedule()
+                have = _ids(jobs)
+                now = datetime.now()
+                for j in removed:
+                    if (not j.get("offer_key") and str(j["lesson_id"]) not in have
+                            and datetime.fromisoformat(j["run_at"]) > now):
+                        jobs.append(dict(j, id=max((x["id"] for x in jobs), default=0) + 1))
+                plan.save_schedule(jobs)
+            try:
+                return plan.sync(force=True)
+            except Exception as e:
+                log.warning(f"Resume: sync failed ({e}); the background loop retries")
+                return 0
+
+        label = ("Pause" if on else "Resume") + f" week of {mon:%d.%m.}"
+        applied, n = change(label, pause if on else resume)
+        if not applied:
+            return {"pending": True, "message": BUSY_TEXT}
+        return {"message": (f"Week paused — {n} sign-up{'s' if n != 1 else ''} taken off" if on
+                            else "Week resumed — its dates are queued again")}
+
+    def api_get_calendar(self, q):
+        c = week.calendar_settings()
+        path = f"/cal/{c['token']}.ics"
+        return {"enabled": bool(c.get("enabled")), "path": path,
+                "url": (PUBLIC_URL + path) if PUBLIC_URL else None}
+
+    def api_post_calendar(self, b):
+        def go(c):
+            if "enabled" in b:
+                c["enabled"] = bool(b["enabled"])
+            if b.get("new_link"):
+                c["token"] = secrets.token_urlsafe(24)
+            return c
+        week.calendar_settings()
+        week.CALENDAR.update(go)
+        return self.api_get_calendar({})
+
+    def calendar_feed(self, path):
+        """GET /cal/<token>.ics — no login (calendar apps can't log in); the
+        long random token is the key, and it can be switched off or renewed."""
+        c = week.calendar_settings()
+        token = path[len("/cal/"):-len(".ics")] if path.endswith(".ics") else ""
+        if not c.get("enabled") or not hmac.compare_digest(token.encode(), c["token"].encode()):
+            raise ApiError(404, "Not found")
+        body = week.calendar_ics(week_result(starred=False), plan)
+        self.send(200, body, "text/calendar; charset=utf-8",
+                  {"Cache-Control": "no-store", "Content-Disposition": 'inline; filename="asvz.ics"'})
 
     def api_get_notify(self, q):
         n = week.notify_settings()
         return {"enabled": n["enabled"], "server": n["server"], "topic": n["topic"],
-                "events": n["events"], "labels": {k: v[0] for k, v in week.EVENT_TEXT.items()}}
+                "events": n["events"],
+                "labels": {**{k: v[0] for k, v in week.EVENT_TEXT.items()},
+                           "radar": "Free-spot radar: a spot opens in a starred course you're not signed up for",
+                           "summary": f"Sunday summary at {week.SUMMARY_HOUR}:00: your sign-ups for the week ahead"}}
 
     def api_post_notify(self, b):
         def go(n):

@@ -1,6 +1,8 @@
 # coding: utf-8
 """Made-up ASVZ search API answers for sandbox tests (no network needed).
 Shape copied from what asvz_plan._lesson_from_api reads."""
+import json
+import os
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -16,7 +18,9 @@ TEMPLATES = [  # sport, title, weekday, start, minutes, place, level, trainer, f
     ("45743", "Badminton Free Play", 4, "12:15", 90, "Sport Center Irchel", "Mittlere", "Fritz Feder", 20),
     ("45645", "Kraft & Cardio", 1, "06:45", 60, "Sport Center Hönggerberg", "Alle", "Gina Gym", 8),
     ("45737", "Unihockey", 6, "16:00", 120, "Sport Center Fluntern", "Fortgeschrittene", "Hans Stock", 1),
+    ("122920", "Power Yoga", 1, "19:00", 60, "ASVZ Online", "Alle", "Ina Flex", 6),  # overlaps Volleyball Mixed
 ]
+FREE_FILE = os.environ.get("VB_TEST_FREE")  # {"<title>": free} to change places while running
 WEEKS = 7
 _next_id = [700000]
 
@@ -25,9 +29,13 @@ def _lessons():
     now = datetime.now(ZURICH)
     today = now.date()
     out = []
+    override = {}
+    if FREE_FILE and os.path.exists(FREE_FILE):
+        override = json.load(open(FREE_FILE))
     lid = 700000
     for t in TEMPLATES:
         sport_id, title, wd, start, mins, place, level, trainer, free = t
+        free = override.get(title, free)
         h, m = map(int, start.split(":"))
         first = today + timedelta(days=(wd - today.weekday()) % 7)
         for w in range(WEEKS):

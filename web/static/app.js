@@ -174,6 +174,10 @@ function starButton(on, label, onToggle) {
   return b;
 }
 
+function showOverlaps(r, delay = 900) {
+  (r.overlaps || []).forEach((m, i) => setTimeout(() => toast("⚠ " + m, 8000), delay * (i + 1)));
+}
+
 async function setFav(kind, id, on, extra = {}) {
   state.favs = await api("favs", { kind, id, on, ...extra });
   toast(on ? "Starred" : "Star removed", 1800);
@@ -360,11 +364,13 @@ function renderWeek() {
     el("small", {}, `${lbl(days[0].date)} – ${lbl(days[6].date)}`));
   $("#wk-prev").disabled = state.weekIdx === 0;
   $("#wk-next").disabled = state.weekIdx >= w.weeks - 1;
+  renderPause(days);
 
   const byDay = {};
   for (const it of w.items) (byDay[dayKey(it.start)] ||= []).push(it);
   const grid = $("#week-grid");
   grid.replaceChildren();
+  grid.classList.toggle("paused", w.paused_weeks.includes(mondayKey(days)));
   const today = dayKey(now());
   for (const { key, parts: p } of days) {
     const items = byDay[key] || [];
@@ -382,12 +388,36 @@ function renderWeek() {
 
 function blockEl(it) {
   const [ic, cls] = KIND[it.kind] || KIND.queued;
-  const sub = it.kind === "signed" && it.place ? `place ${it.place}` : it.kind === "starred" && it.free != null
+  const sub = it.overlaps ? el("span", { class: "warn-txt" }, `⚠ overlaps ${it.overlaps[0]}`)
+    : it.kind === "signed" && it.place ? `place ${it.place}` : it.kind === "starred" && it.free != null
     ? (it.free > 0 ? `${it.free} free` : "full") : it.location || "";
-  return el("button", { class: "block " + it.kind, color: sportColor(sportOf(it)), onclick: () => openSheet(it) },
+  return el("button", { class: "block " + it.kind + (it.overlaps ? " overlap" : ""), color: sportColor(sportOf(it)), onclick: () => openSheet(it) },
     el("div", { class: "time" }, hm(it.start), el("small", {}, hm(it.end))),
     el("div", { class: "bt" }, el("div", { class: "n" }, it.title || `Lesson ${it.lesson_id}`), el("div", { class: "p" }, sub)),
     icon(ic, "st " + cls));
+}
+
+// "YYYY-MM-DD" of the week's Monday, the key the server uses for pauses
+function mondayKey(days) { return days[0].key; }
+
+function renderPause(days) {
+  const box = $("#wk-pause"), key = mondayKey(days);
+  const paused = state.week.paused_weeks.includes(key);
+  const past = days[6].key < dayKey(now());
+  box.replaceChildren();
+  if (past) return;
+  const go = (on) => async (ev) => {
+    const btn = ev.currentTarget;  // reset to null once the click is over, so keep it before awaiting
+    if (on && !await confirmDialog("Pause this week?", "All sign-ups of this week are taken off, and weekly courses "
+      + "skip it. Resume puts them back (if enrollment is still ahead).", "Pause", false)) return;
+    busy(btn, async () => {
+      try { const r = await api("pause", { week: key, on }); toast(r.message, r.pending ? 7000 : 4000); } catch (e) { toast(e.message); }
+      loadWeek();
+    });
+  };
+  if (paused) box.append(el("div", { class: "paused-note" }, icon("clock"), "Paused — nothing gets signed up this week",
+    el("button", { class: "btn small", onclick: go(false) }, "Resume")));
+  else box.append(el("button", { class: "btn small ghost", onclick: go(true) }, "Pause this week"));
 }
 
 $("#wk-prev").addEventListener("click", () => { state.weekIdx--; renderWeek(); });
@@ -410,7 +440,8 @@ function openSheet(it) {
   body.replaceChildren(el("div", { class: "grab" }),
     el("h3", {}, it.title || `Lesson ${it.lesson_id}`),
     el("div", { class: "meta" }, [`${shortDate(it.start)}–${hm(it.end)}`, it.location, it.niveau].filter(Boolean).join(" · ")),
-    el("div", { class: "stline" }, icon(ic, "st " + cls), el("div", {}, status)), actions);
+    el("div", { class: "stline" }, icon(ic, "st " + cls), el("div", {}, status)),
+    it.overlaps ? el("div", { class: "paused-note" }, `⚠ Overlaps with ${it.overlaps.join(", ")}`) : null, actions);
   const after = async () => { closeSheet(); await loadWeek(); };
 
   if (it.kind === "starred" && it.bookable !== false) {
@@ -419,11 +450,11 @@ function openSheet(it) {
     actions.append(el("label", { class: "opt" }, "If full, wait for a spot", watch),
       el("button", { class: "btn primary wide", onclick: (ev) => busy(ev.currentTarget, async () => {
         try { const r = await api("signup_lesson", { sport: it.sport_id, key: it.offer_key, lesson_id: it.lesson_id, watch: watch.checked });
-              toast(r.message, r.pending ? 7000 : 3000); await after(); } catch (e) { toast(e.message); }
+              toast(r.message, r.pending ? 7000 : 3000); showOverlaps(r); await after(); } catch (e) { toast(e.message); }
       }) }, "Sign up for this date"),
       el("button", { class: "btn wide", onclick: (ev) => busy(ev.currentTarget, async () => {
         try { const r = await api("signup", { sport: it.sport_id, keys: [it.offer_key], weekly: true, watch: watch.checked });
-              toast(r.pending ? r.message : `Every week · ${plural(r.queued, "date")} queued`, r.pending ? 7000 : 3000); await after(); }
+              toast(r.pending ? r.message : `Every week · ${plural(r.queued, "date")} queued`, r.pending ? 7000 : 3000); showOverlaps(r); await after(); }
         catch (e) { toast(e.message); }
       }) }, "Sign up every week"));
   }
@@ -462,6 +493,7 @@ function openSheet(it) {
 
 // ---- your courses: plan entries + starred courses
 async function renderCourses() {
+  if (!state.calShown) { state.calShown = true; renderCalendar(); }  // not on every refresh
   try { state.plan = await api("plan"); } catch { return; }
   const list = $("#courses");
   list.replaceChildren();
@@ -499,12 +531,42 @@ async function renderCourses() {
         starButton(true, "Star", async (on) => { await setFav("offer", key, on, { sport: m.sport_id }); loadWeek(); }),
         el("button", { class: "btn small primary", onclick: (ev) => busy(ev.currentTarget, async () => {
           try { const r = await api("signup", { sport: m.sport_id, keys: [key], weekly: true, watch: true });
-                toast(r.pending ? r.message : `Every week · ${plural(r.queued, "date")} queued`, r.pending ? 7000 : 3000); }
+                toast(r.pending ? r.message : `Every week · ${plural(r.queued, "date")} queued`, r.pending ? 7000 : 3000); showOverlaps(r); }
           catch (err) { toast(err.message); }
           loadWeek();
         }) }, "Every week"))));
   }
 }
+async function renderCalendar() {
+  let c;
+  try { c = await api("calendar"); } catch { return; }
+  const url = c.url || location.origin + c.path;
+  const webcal = url.replace(/^https?:/, "webcal:");
+  const box = $("#calendar");
+  const on = el("input", { type: "checkbox", class: "switch", "aria-label": "Calendar link" });
+  on.checked = c.enabled;
+  on.addEventListener("change", async () => { try { await api("calendar", { enabled: on.checked }); } catch (e) { toast(e.message); } renderCalendar(); });
+  box.replaceChildren(el("label", { class: "row tap" }, el("div", { class: "row-text" },
+    el("div", { class: "row-title" }, "Calendar link"),
+    el("div", { class: "row-sub" }, c.enabled ? "On — your calendar app can read it" : "Off — the link doesn't work")), on));
+  if (!c.enabled) return;
+  const copy = el("button", { class: "btn small", onclick: async () => {
+    try { await navigator.clipboard.writeText(url); toast("Link copied"); } catch { toast(url, 9000); } } }, "Copy");
+  box.append(
+    el("div", { class: "inline-form" }, el("span", { class: "topic" }, url), copy),
+    el("div", { class: "inline-form" },
+      el("a", { class: "btn primary", href: "https://calendar.google.com/calendar/r?cid=" + encodeURIComponent(webcal),
+        target: "_blank", rel: "noopener noreferrer" }, "Add to Google Calendar"),
+      el("a", { class: "btn", href: webcal }, "Other calendar app"),
+      el("button", { class: "btn ghost", onclick: async () => {
+        if (!await confirmDialog("New link?", "The old link stops working. Subscribe again with the new one.", "New link", false)) return;
+        try { await api("calendar", { new_link: true }); } catch (e) { toast(e.message); } renderCalendar();
+      } }, "New link")),
+    el("div", { class: "row" }, el("div", { class: "row-sub" },
+      "Keep the link private: whoever has it sees your sign-ups (course names and times, nothing else). "
+      + "Google Calendar refreshes subscribed calendars every few hours, so changes show up with a delay.")));
+}
+
 $("#ics-plan").addEventListener("click", (ev) => busy(ev.currentTarget, async () => {
   try { download(await api("ics", { plan: true }), "asvz-plan.ics", "text/calendar"); toast("Saved — import it in Google Calendar (Settings → Import & export)", 6000); }
   catch (e) { toast(e.message); }
@@ -687,6 +749,7 @@ async function signUp() {
     if (r.pending) { toast(r.message, 7000); syncChecks(); return; }
     toast(`Signed up for ${plural(r.offers, "course")} (${weekly ? "every week" : "the next date"}) · ${plural(r.queued, "date")} queued`);
     r.messages.forEach((m, i) => setTimeout(() => toast(m, 6000), 700 * (i + 1)));
+    showOverlaps(r, 700 * (r.messages.length + 1));
     try { state.plan = await api("plan"); } catch { /* ignore */ }
     rebuildOffers();
   } catch (e) { toast(e.message, 6000); }

@@ -18,6 +18,23 @@ phone only sends commands and shows status.
 - **Bot**: the bot's timer on/off, run now, phone notifications, every run of
   the bot (newest first, tap for its log), free-spot watchers, add a lesson by
   number.
+- **Pause a week**: in the week view, "Pause this week" takes that week's
+  sign-ups off the list, and weekly courses skip it. "Resume" puts them
+  back, including the ones added in the text menu (if they're still ahead).
+- **Overlap warning**: sign-ups at the same time are marked ⚠ in the week
+  view, and you get a warning right when you sign up.
+- **Calendar subscription**: a private link (Week → Calendar subscription)
+  that Google Calendar or any calendar app subscribes to: your actual
+  sign-ups (queued, signed up ✓, waiting for a spot), with skipped and
+  paused dates left out. It needs no login, so the long random link is the
+  key. You can switch it off or make a new one at any time. Google refreshes
+  subscribed calendars only every few hours.
+- **Sunday summary**: Sunday at 19:00, one notification with next week's
+  sign-ups (or "paused").
+- **Free-spot radar**: every 5 minutes the starred courses you're *not*
+  signed up for are checked at ASVZ. When a full date gets a free place
+  while enrollment is open, you get a notification and can sign up in the
+  app.
 - **Phone notifications** via the free ntfy app: signed up, full → watching,
   a freed-up spot taken, missed, failed attempt, and "the bot isn't running".
   The topic is a long random name and works like a password. Messages contain

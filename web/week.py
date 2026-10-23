@@ -9,6 +9,9 @@ helper every MONITOR_SECONDS and turns lines like "Job #3 finished
 successfully" into a per-lesson result (history.json), and sends a phone
 notification (ntfy) for each new one.
 
+Also here: pausing a week, the overlap check, the Sunday summary, the
+free-spot radar for starred courses and the calendar feed.
+
 Everything here lives in the data dir; nothing touches the bot folder.
 """
 
@@ -62,11 +65,13 @@ class Store:
 
 
 def setup(data_dir):
-    global FAVS, HISTORY, NOTIFY, MONITOR
+    global FAVS, HISTORY, NOTIFY, MONITOR, PAUSES, CALENDAR
     FAVS = Store(os.path.join(data_dir, "favorites.json"), {"sports": {}, "offers": {}})
     HISTORY = Store(os.path.join(data_dir, "history.json"), {"lessons": {}})
     NOTIFY = Store(os.path.join(data_dir, "notify.json"), {})
     MONITOR = Store(os.path.join(data_dir, "monitor.json"), {})
+    PAUSES = Store(os.path.join(data_dir, "pauses.json"), {"weeks": {}})
+    CALENDAR = Store(os.path.join(data_dir, "calendar.json"), {})
 
 
 # ----------------------------------------------------------------------
@@ -219,7 +224,11 @@ EVENT_TEXT = {  # type -> (title, tags, priority)
     "error": ("Bot error", "rotating_light", 4),
     "health_bad": ("The bot isn't running", "rotating_light", 5),
     "health_ok": ("The bot runs again", "white_check_mark", 3),
+    "radar": ("A spot is free in a starred course", "bell", 4),
+    "summary": ("Your week ahead", "calendar", 3),
 }
+SUMMARY_HOUR = 19          # Sunday, Zurich time
+RADAR_SECONDS = int(os.environ.get("VB_RADAR_SECONDS", "300"))  # how often starred courses are checked for freed spots
 DEFAULT_EVENTS = {k: True for k in EVENT_TEXT}
 
 
@@ -261,6 +270,9 @@ def notify_event(ev, public_url=None):
     if not n["enabled"] or not n["events"].get(ev["type"], True):
         return
     title, tags, prio = EVENT_TEXT[ev["type"]]
+    if ev.get("message"):  # events that bring their own text (radar, summary)
+        send(title, ev["message"], tags, prio, click=public_url)
+        return
     h = HISTORY.load()["lessons"].get(ev.get("lesson_id") or "", {})
     what = h.get("title") or (f"Lesson {ev['lesson_id']}" if ev.get("lesson_id") else "")
     when = aware(h.get("lesson_start"))
@@ -287,8 +299,10 @@ def remember_jobs(jobs):
     MONITOR.update(go)
 
 
-def monitor_once(read, read_log, runs_from_journal, timer_status, public_url=None):
-    """read(): {"jobs", "watchers"}; read_log(): {"journal", "watchers"}."""
+def monitor_once(read, read_log, runs_from_journal, timer_status, public_url=None,
+                 week_fn=None, radar_fn=None):
+    """read(): {"jobs", "watchers"}; read_log(): {"journal", "watchers"};
+    week_fn(): build_week() result; radar_fn(): fresh lessons of starred courses."""
     data = read()
     remember_jobs(data["jobs"])
     state = MONITOR.load()
@@ -330,6 +344,16 @@ def monitor_once(read, read_log, runs_from_journal, timer_status, public_url=Non
     elif not late and state.get("health_bad"):
         state["health_bad"] = False
         new_events.append({"type": "health_ok", "t": int(time.time() * 1000)})
+    if week_fn:
+        ev = sunday_summary(state, week_fn)
+        if ev:
+            new_events.append(ev)
+    if radar_fn and time.time() - state.get("radar_at", 0) >= RADAR_SECONDS:
+        state["radar_at"] = time.time()
+        try:
+            new_events += radar(state, radar_fn(), week_fn()["items"] if week_fn else [], first)
+        except Exception as e:
+            log.warning(f"Radar: {e}")
     state.setdefault("last_run", 0)   # marks the quiet first pass as done
     with MONITOR.lock:   # merge: remember_jobs() may have added jobs meanwhile
         merged = {**jobs_seen, **MONITOR.load().get("jobs_seen", {})}
@@ -415,10 +439,149 @@ def build_week(jobs, watchers, plan_entries, starred_lessons, offer_key, alive):
             enroll_start=l["oe_from"].isoformat() if l["oe_from"] else None,
             bookable=bool(l["oe_enabled"] and (l["oe_to"] or l["start"]) > now))
     items.sort(key=lambda i: i["start"])
+    mark_overlaps(items)
+    paused = PAUSES.load()["weeks"]
+    for i in items:
+        i["paused"] = week_key(aware(i["start"])) in paused
 
     upcoming = [i for i in items if i["kind"] in ("queued", "enrolling", "retrying")
                 and i.get("enroll_start")]
     nxt = next((i for i in upcoming if aware(i["enroll_start"]) > now), None)
     active = next((i for i in upcoming if aware(i["enroll_start"]) <= now), None)
     return {"week_start": start.isoformat(), "weeks": WEEKS_SHOWN, "items": items,
-            "next_up": active or nxt}
+            "next_up": active or nxt, "paused_weeks": sorted(paused)}
+
+
+# ----------------------------------------------------------------------
+# pausing a week
+# ----------------------------------------------------------------------
+
+def week_key(dt):
+    """Monday of dt's week (Zurich), as 'YYYY-MM-DD'."""
+    return monday(dt).date().isoformat()
+
+
+def is_paused(dt):
+    return week_key(dt) in PAUSES.load()["weeks"]
+
+
+# ----------------------------------------------------------------------
+# overlaps
+# ----------------------------------------------------------------------
+
+ACTIVE = ("queued", "enrolling", "retrying", "signed", "watching")
+
+
+def mark_overlaps(items):
+    """item["overlaps"] = titles of other sign-ups at the same time."""
+    act = [i for i in items if i["kind"] in ACTIVE]
+    for a in act:
+        a_s, a_e = aware(a["start"]), aware(a["end"])
+        others = [b for b in act if b is not a and aware(b["start"]) < a_e and a_s < aware(b["end"])]
+        if others:
+            a["overlaps"] = [b.get("title") or f"Lesson {b['lesson_id']}" for b in others]
+
+
+def overlap_messages(items, offer_keys=(), lesson_ids=()):
+    """Readable warnings for sign-ups of the given courses/dates that clash."""
+    out = []
+    for i in items:
+        if i.get("overlaps") and (i.get("offer_key") in offer_keys or i["lesson_id"] in lesson_ids):
+            out.append(f"Overlap: {i.get('title') or 'Lesson ' + i['lesson_id']} "
+                       f"({short(aware(i['start']))}) clashes with {', '.join(i['overlaps'])}")
+    return out[:5]
+
+
+# ----------------------------------------------------------------------
+# Sunday summary
+# ----------------------------------------------------------------------
+
+def summary_text(result):
+    nxt = monday() + timedelta(weeks=1)
+    key = nxt.date().isoformat()
+    if key in result.get("paused_weeks", []):
+        return "Next week is paused - nothing gets signed up."
+    lines = []
+    for i in result["items"]:
+        s = aware(i["start"])
+        if not (nxt <= s < nxt + timedelta(weeks=1)) or i["kind"] not in ACTIVE:
+            continue
+        mark = {"signed": " (signed up)", "watching": " (waiting for a spot)"}.get(i["kind"], "")
+        lines.append(f"{short(s)} {i.get('title') or 'Lesson ' + i['lesson_id']}{mark}"
+                     + (" - overlaps!" if i.get("overlaps") else ""))
+    if not lines:
+        return "Nothing queued for next week. Star or sign up for courses in the app."
+    return f"{len(lines)} sign-up{'s' if len(lines) != 1 else ''} next week:\n" + "\n".join(lines)
+
+
+def sunday_summary(state, week_fn):
+    z = datetime.now(ZURICH)
+    today = z.date().isoformat()
+    if z.weekday() != 6 or z.hour < SUMMARY_HOUR or state.get("summary_sent") == today:
+        return None
+    state["summary_sent"] = today
+    return {"type": "summary", "t": int(time.time() * 1000), "message": summary_text(week_fn())}
+
+
+# ----------------------------------------------------------------------
+# free-spot radar for starred courses you're not signed up for
+# ----------------------------------------------------------------------
+
+def radar(state, lessons, items, quiet):
+    """Notifies when a date of a starred course goes from full to free
+    while its enrollment is open. Remembers the last free count per date."""
+    now = datetime.now(timezone.utc)
+    mine = {i["lesson_id"] for i in items if i["kind"] in ACTIVE}
+    seen = state.setdefault("radar", {})
+    events, keep = [], {}
+    for l in lessons:
+        lid = str(l["id"])
+        free = l.get("free")
+        is_open = (l["oe_enabled"] and not l["cancelled"] and (l["oe_from"] or now) <= now
+                   < (l["oe_to"] or l["start"]))
+        if free is None or not is_open or lid in mine:
+            continue
+        keep[lid] = free
+        if not quiet and seen.get(lid) is not None and seen[lid] <= 0 < free:
+            events.append({"type": "radar", "lesson_id": lid, "t": int(time.time() * 1000),
+                           "message": f"{l['sport_name']}: {l['title']} · {short(l['start'])} · "
+                                      f"{l['location']} · {free} free now - tap to sign up"})
+    state["radar"] = keep
+    return events
+
+
+# ----------------------------------------------------------------------
+# calendar feed (subscribed by Google Calendar & co. through a secret link)
+# ----------------------------------------------------------------------
+
+def calendar_settings():
+    c = CALENDAR.load()
+    if not c.get("token"):
+        c["token"] = secrets.token_urlsafe(24)
+        c.setdefault("enabled", False)
+        CALENDAR.save(c)
+    return c
+
+
+def calendar_ics(result, plan):
+    """Your actual sign-ups (queued, signed up, waiting for a spot) as an
+    .ics feed; skipped and paused dates simply aren't in it."""
+    label = {"signed": "Signed up", "watching": "Full - waiting for a spot",
+             "enrolling": "Signing up now", "retrying": "Retrying"}
+    out = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//ASVZ Bot//EN", "CALSCALE:GREGORIAN",
+           "METHOD:PUBLISH", "X-WR-CALNAME:ASVZ", "X-WR-TIMEZONE:Europe/Zurich",
+           "REFRESH-INTERVAL;VALUE=DURATION:PT1H", "X-PUBLISHED-TTL:PT1H",
+           *plan._VTIMEZONE.split("\n")]
+    for i in result["items"]:
+        if i["kind"] not in ACTIVE:
+            continue
+        title = i.get("title") or f"Lesson {i['lesson_id']}"
+        status = label.get(i["kind"], "Queued - the bot signs you up")
+        if i["kind"] == "signed" and i.get("place"):
+            status += f", place {i['place']}"
+        mark = "✓ " if i["kind"] == "signed" else ""
+        out += plan._event(f"lesson-{i['lesson_id']}@asvz-bot", f"{mark}ASVZ {title}",
+                           plan._ics_dt(i["start"]), plan._ics_dt(i["end"]),
+                           i.get("location") or "", status, i["url"])
+    out.append("END:VCALENDAR")
+    return "\r\n".join(plan._fold(line) for line in out) + "\r\n"
