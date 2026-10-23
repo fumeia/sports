@@ -10,6 +10,6 @@ services:
       COUCHDB_PASSWORD: ${COUCHDB_PASSWORD}
     volumes:
       - ./data:/opt/couchdb/data
-      - ./local.ini:/opt/couchdb/etc/local.d/livesync.ini:ro
+      - ./local.ini:/opt/couchdb/etc/local.d/livesync.ini
     ports:
       - "127.0.0.1:5984:5984"

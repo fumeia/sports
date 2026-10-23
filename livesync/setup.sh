@@ -57,9 +57,12 @@ PW="$(sed -n 's/^COUCHDB_PASSWORD=//p' "$DIR/.env")"
 
 cp "$HERE/local.ini" "$DIR/local.ini"
 cp "$HERE/docker-compose.yml" "$DIR/docker-compose.yml"
-chown -R 5984:5984 "$DIR/data"          # the uid CouchDB runs as in its image
+# CouchDB's start script makes everything under its folders belong to its
+# user (uid 5984) and quits silently if it can't, so the settings file
+# must be theirs and writable (a read-only mount made it restart forever).
+chown -R 5984:5984 "$DIR/data" "$DIR/local.ini"
 (cd "$DIR" && docker compose config -q) || die "docker compose rejected the config."
-(cd "$DIR" && docker compose up -d 2>&1 | tail -2)
+(cd "$DIR" && docker compose up -d --force-recreate 2>&1 | tail -2)
 
 info "Waiting for CouchDB (up to 2 minutes)…"
 for _ in $(seq 1 120); do
