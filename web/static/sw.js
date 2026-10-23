@@ -1,7 +1,7 @@
 // Service worker: lets the page be installed and open instantly.
 // Caches only the page itself (network first), never /api/ data —
 // status must always come live from the server.
-const CACHE = "vb-shell-v1";
+const CACHE = "vb-shell-v2";
 const SHELL = ["./", "index.html", "app.css", "app.js", "icon.svg", "manifest.webmanifest"];
 
 self.addEventListener("install", (ev) => {

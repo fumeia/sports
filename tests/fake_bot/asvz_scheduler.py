@@ -9,6 +9,8 @@ import json
 import logging
 import os
 import signal
+import subprocess
+import sys
 import time
 from datetime import datetime, timedelta
 
@@ -24,6 +26,27 @@ def load():
 
 def save(jobs):
     json.dump({"jobs": jobs}, open("asvz_schedule.json", "w"), indent=2)
+
+
+def spawn_watcher(j):
+    """Like the real one: a detached process, registered in asvz_watchers.json,
+    logging to watcher_logs/job_<id>.log; this one "gets a spot" after 20 s."""
+    os.makedirs("watcher_logs", exist_ok=True)
+    log = f"watcher_logs/job_{j['id']}.log"
+    with open(log, "a") as f:
+        f.write("==================================================\n"
+                f"[watcher spawn] job #{j['id']} lesson {j['lesson_id']}\n")
+    code = ("import time,sys; f=open(sys.argv[1],'a'); f.write('[watch] check #1: badge status = full\\n'); f.flush();"
+            "time.sleep(20); f.write('Your place number is: 17\\n[watch] Enrollment succeeded.\\n')")
+    p = subprocess.Popen([sys.executable, "-c", code, log], start_new_session=True)
+    try:
+        w = json.load(open("asvz_watchers.json"))
+    except (FileNotFoundError, ValueError):
+        w = {}
+    w[str(j["id"])] = {"pid": p.pid, "lesson_id": j["lesson_id"], "lesson_url": j["lesson_url"],
+                       "log_path": log, "spawned_at": datetime.now().isoformat(timespec="minutes")}
+    json.dump(w, open("asvz_watchers.json", "w"), indent=2)
+    logging.info(f"[schedule run] Handing job #{j['id']} off to a detached watcher process (log: {log}).")
 
 
 def main():
@@ -67,6 +90,10 @@ def main():
                       else datetime.fromisoformat(j["enrollment_start"]) + timedelta(minutes=5))
             if now > cutoff:
                 logging.info(f"[schedule run] Job #{j['id']} missed the window, removing.")
+                continue
+            logging.info(f"[schedule run] Starting job #{j['id']} (now={now})")
+            if j.get("watch_free_slot") and os.environ.get("VB_TEST_FULL") == "1":
+                spawn_watcher(j)
                 continue
             logging.info(f"[schedule run] Executing job #{j['id']} for lesson {j['lesson_id']}")
             AsvzEnroller(j["lesson_url"], {}).enroll()

@@ -63,6 +63,8 @@ SCHEDULER_NAME = os.environ.get("VB_SCHEDULER_SCRIPT", "asvz_scheduler.py")
 TIMER_UNIT = os.environ.get("VB_TIMER_UNIT", "asvz-scheduler")   # for display only
 HELPER = os.environ.get("VB_HELPER_CMD", "sudo -n /usr/local/sbin/vb-bot-helper").split()
 QUEUE_DAYS = int(os.environ.get("VB_QUEUE_DAYS", "8"))
+PUBLIC_URL = os.environ.get("VB_PUBLIC_URL") or None   # tap target of notifications
+MONITOR_SECONDS = int(os.environ.get("VB_MONITOR_SECONDS", "30"))
 # Dev/test only: allow the session cookie over plain http://localhost.
 INSECURE_COOKIE = os.environ.get("VB_INSECURE_COOKIE") == "1"
 
@@ -78,11 +80,13 @@ REPAIR_WINDOW = 15 * 60
 
 sys.path.insert(0, HERE)
 import asvz_plan as plan  # noqa: E402  (copy of the desktop app's module)
+import week  # noqa: E402  (favourites, results, week view, notifications)
 
 # Plan + lock in our data dir; the job list is the bot's own file, read
 # and written through the helper (load_schedule/save_schedule below).
 plan.PLAN_FILENAME = os.path.join(DATA_DIR, "asvz_plan.json")
 plan.SCHEDULE_LOCK = os.path.join(DATA_DIR, ".schedule.lock")
+week.setup(DATA_DIR)
 
 _bookable = plan.bookable
 
@@ -269,6 +273,7 @@ def _after_change(before, started):
         if changed:
             plan.save_schedule(keep)
             jobs = keep
+    week.remember_jobs(jobs)
     b, a = _ids(before), _ids(jobs)
     until = time.time() + REPAIR_WINDOW
     for lid in a.keys() - b.keys():
@@ -364,6 +369,48 @@ def background_loop():
                         kick_scheduler()
         except Exception:
             log.exception("Background loop")
+
+
+def monitor_loop():
+    """Results + notifications from the bot's log (see week.py)."""
+    while True:
+        try:
+            week.monitor_once(lambda: helper("read"), lambda: helper("log", "400"),
+                              runs_from_journal, timer_status, PUBLIC_URL)
+        except Exception:
+            log.exception("Monitor")
+        time.sleep(MONITOR_SECONDS)
+
+
+def starred_lessons():
+    """Upcoming lessons of the starred courses (from the cached ASVZ data)."""
+    favs = week.FAVS.load()["offers"]
+    out = []
+    for sport_id in {m.get("sport_id") for m in favs.values() if m.get("sport_id")}:
+        try:
+            offers = get_offers(sport_id)
+        except Exception as e:
+            log.warning(f"Starred: couldn't load sport {sport_id}: {e}")
+            continue
+        for o in offers:
+            if o["key"] in favs:
+                out += o["lessons"]
+    return out
+
+
+def health(t=None):
+    t = t or timer_status()
+    try:
+        runs = runs_from_journal(helper("log", "60")["journal"])
+    except HelperError:
+        runs = []
+    last = runs[0] if runs else None
+    return {"timer": t.get("active"), "next": t.get("next"), "running": bool(scheduler_runs()),
+            "last_run": last["start"] if last else None,
+            "last_kind": last["kind"] if last else None,
+            "last_label": last["label"] if last else None,
+            "late": bool(t.get("active") and last and
+                         time.time() * 1000 - last["start"] > week.HEALTH_LATE.total_seconds() * 1000)}
 
 
 # ----------------------------------------------------------------------
@@ -831,6 +878,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def api_get_offers(self, q):
         sport = q.get("sport") or "all"
+        if sport == "starred":
+            favs = week.FAVS.load()["offers"]
+            out = []
+            for sid in {m.get("sport_id") for m in favs.values() if m.get("sport_id")}:
+                try:
+                    out += [o for o in get_offers(sid, q.get("force") == "1") if o["key"] in favs]
+                except Exception as e:
+                    raise ApiError(502, f"Couldn't load offers: {e}")
+            return {"offers": [offer_json(o) for o in out]}
         try:
             offers = get_offers(sport, q.get("force") == "1")
         except Exception as e:
@@ -841,7 +897,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         keys = b.get("keys")
         if not isinstance(keys, list) or not keys or len(keys) > 200:
             raise ApiError(400, "Choose at least one offer")
-        offers = offers_for_keys(str(b.get("sport") or "all"), [str(k) for k in keys])
+        sport = str(b.get("sport") or "all")
+        if sport == "starred":
+            offers = []
+            for sid in {str(k).split("|", 1)[0] for k in keys}:
+                offers += offers_for_keys(sid, [str(k) for k in keys if str(k).startswith(sid + "|")])
+        else:
+            offers = offers_for_keys(sport, [str(k) for k in keys])
         if not offers:
             raise ApiError(409, "These offers are gone from ASVZ — reload the list")
         return offers
@@ -950,6 +1012,95 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return {"message": out.strip().splitlines()[-1] if out.strip() else "Watcher stopped"}
 
 
+    # ---- week, favourites, notifications (week.py)
+    def api_get_week(self, q):
+        data = helper("read")
+        result = week.build_week(data["jobs"], data["watchers"], plan.load_plan()["entries"],
+                                 starred_lessons(), plan.offer_key, pid_alive)
+        result.update(health=health(), pending=[label for label, _ in PENDING],
+                      server_time=datetime.now().astimezone().isoformat(timespec="seconds"))
+        return result
+
+    def api_get_favs(self, q):
+        return week.FAVS.load()
+
+    def api_post_favs(self, b):
+        kind, ident, on = b.get("kind"), str(b.get("id", ""))[:300], bool(b.get("on"))
+        if kind not in ("sport", "offer") or not ident:
+            raise ApiError(400, "Bad favourite")
+        meta = {}
+        if kind == "sport":
+            meta = {"name": str(b.get("name", ""))[:100]}
+        elif on:
+            sport = str(b.get("sport") or ident.split("|", 1)[0])
+            try:
+                o = next((o for o in get_offers(sport) if o["key"] == ident), None)
+            except Exception as e:
+                raise ApiError(502, f"Can't reach ASVZ: {e}")
+            if not o:
+                raise ApiError(404, "Course not found at ASVZ")
+            meta = {k: o[k] for k in week.OFFER_FIELDS}
+        return week.set_fav(kind, ident, on, meta)
+
+    def api_post_signup_lesson(self, b):
+        """Sign up for one specific date (e.g. a starred course in the week view)."""
+        if not bot_info().get("credentials"):
+            raise ApiError(409, "The bot has no ASVZ login on the server yet.")
+        key, lid, watch = str(b.get("key", "")), str(b.get("lesson_id", "")), bool(b.get("watch"))
+        offer = next((o for o in get_offers(str(b.get("sport") or key.split("|", 1)[0]))
+                      if o["key"] == key), None)
+        lesson = next((l for l in (offer or {}).get("lessons", []) if str(l["id"]) == lid), None)
+        if not lesson:
+            raise ApiError(404, "That date isn't at ASVZ anymore — reload")
+
+        def go():
+            with plan.schedule_lock():
+                p = plan.load_plan()
+                entry = next((e for e in p["entries"] if e["key"] == key), None)
+                if entry is None:
+                    entry = plan._entry_from_offer(offer, False, watch)
+                    p["entries"].append(entry)
+                n = len(plan._queue_lessons(entry, [lesson]))
+                plan.save_plan(p)
+                return n
+        applied, n = change(f"Sign up: {offer['title']} {week.short(lesson['start'])}", go)
+        if applied:
+            kick_scheduler()
+        return self._changed(applied, "Queued" if n else "Already queued")
+
+    def api_get_notify(self, q):
+        n = week.notify_settings()
+        return {"enabled": n["enabled"], "server": n["server"], "topic": n["topic"],
+                "events": n["events"], "labels": {k: v[0] for k, v in week.EVENT_TEXT.items()}}
+
+    def api_post_notify(self, b):
+        def go(n):
+            if "enabled" in b:
+                n["enabled"] = bool(b["enabled"])
+            if isinstance(b.get("events"), dict):
+                n.setdefault("events", {}).update(
+                    {k: bool(v) for k, v in b["events"].items() if k in week.EVENT_TEXT})
+            if b.get("server"):
+                srv = str(b["server"]).strip().rstrip("/")
+                if not srv.startswith("https://") or len(srv) > 200:
+                    raise ApiError(400, "The ntfy server must be an https:// address")
+                n["server"] = srv
+            if b.get("new_topic"):
+                n["topic"] = ""
+            return n
+        week.notify_settings()
+        week.NOTIFY.update(go)
+        return self.api_get_notify({})
+
+    def api_post_notify_test(self, b):
+        ok = week.send("Test from ASVZ Bot", "Notifications work. You'll get a message like this "
+                       "when you're signed up, a course is full, or something goes wrong.",
+                       "tada", 3, click=PUBLIC_URL, force=True)
+        if not ok:
+            raise ApiError(502, "Couldn't reach the ntfy server — see the page log on the server.")
+        return {"message": "Test sent — it should pop up on your phone in a few seconds."}
+
+
 class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
@@ -970,6 +1121,7 @@ def main():
     except HelperError as e:
         log.error(f"Helper not working: {e}")
     threading.Thread(target=background_loop, daemon=True).start()
+    threading.Thread(target=monitor_loop, daemon=True).start()
     log.info(f"vb listening on http://{HOST}:{PORT} (bot folder {BOT_DIR}, "
              f"timer {TIMER_UNIT}.timer)")
     Server((HOST, PORT), Handler).serve_forever()

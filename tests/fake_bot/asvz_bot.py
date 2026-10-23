@@ -43,5 +43,7 @@ class AsvzEnroller:
         return start - timedelta(days=1), start
 
     def enroll(self):
+        import logging
+        logging.info("Your place number is: 5")
         with open("enrolled.log", "a") as f:
             f.write(f"{datetime.now():%H:%M:%S} enrolled {self.lesson_url}\n")

@@ -5,8 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ASVZ Bot</title>
 <meta name="description" content="Remote control for the ASVZ enrollment bot on your server">
-<meta name="theme-color" content="#ebebeb" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#2e2e32" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f3f4f8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0d0f15" media="(prefers-color-scheme: dark)">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="icon-192.png">
@@ -18,63 +18,83 @@
 <!-- login -->
 <section id="login" class="login" hidden>
   <form id="login-form" class="login-card" autocomplete="on">
-    <img src="icon.svg" alt="" class="login-icon">
+    <img src="icon.svg" alt="">
     <h1>ASVZ Bot</h1>
-    <p class="dim">Remote for the bot on your server</p>
-    <div class="boxed-list">
-      <label class="row entry"><span class="row-title">Login name</span>
+    <p class="dim">Your sign-ups, run by your server</p>
+    <div class="list">
+      <label class="row"><span>Login name</span>
         <input name="user" autocomplete="username" autocapitalize="none" required></label>
-      <label class="row entry"><span class="row-title">Password</span>
+      <label class="row"><span>Password</span>
         <input name="password" type="password" autocomplete="current-password" required></label>
     </div>
     <p id="login-error" class="error-text" role="alert"></p>
-    <button class="btn suggested pill wide" type="submit">Log in</button>
+    <button class="btn primary wide" type="submit">Log in</button>
   </form>
 </section>
 
-<!-- main window -->
 <div id="app" class="window" hidden>
-  <header class="headerbar">
-    <button id="back" class="btn flat icon" aria-label="Back" hidden>
-      <svg viewBox="0 0 16 16"><path d="M10.5 2.5 5 8l5.5 5.5" /></svg></button>
-    <div class="title">
-      <div class="title-main">ASVZ Bot</div>
-      <div id="subtitle" class="title-sub"></div>
+  <header class="topbar">
+    <div class="brand">
+      <img src="icon.svg" alt="">
+      <div><div class="t">ASVZ Bot</div><div class="s" id="subtitle"></div></div>
     </div>
-    <nav class="switcher wide" id="switcher-top"></nav>
-    <button id="menu-btn" class="btn flat icon" aria-label="Menu" aria-haspopup="menu">
-      <svg viewBox="0 0 16 16"><path d="M2.5 4h11M2.5 8h11M2.5 12h11" /></svg></button>
+    <nav class="nav-top" id="nav-top"></nav>
+    <button class="btn ghost icon" id="back" aria-label="Back to sports" hidden>
+      <svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg></button>
+    <button class="btn ghost icon" id="menu-btn" aria-label="Menu" aria-haspopup="menu">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="12" cy="19" r="1.3"/></svg></button>
     <div id="menu" class="popover" role="menu" hidden>
       <button role="menuitem" data-action="reload">Reload</button>
+      <button role="menuitem" data-action="theme">Light / dark</button>
       <button role="menuitem" data-action="logout">Log out</button>
-      <button role="menuitem" data-action="about">About ASVZ Bot</button>
     </div>
   </header>
 
-  <div id="banner" class="banner" hidden>
-    <span>Background checks are off: no sign-ups happen until you turn them on.</span>
-    <button class="btn pill" id="banner-on">Turn on</button>
-  </div>
+  <main>
+    <!-- Week -->
+    <section class="page" id="page-week">
+      <div class="inner">
+        <div>
+          <div id="nextup" class="nextup card"></div>
+          <div id="health" class="health" role="button" tabindex="0"></div>
+        </div>
+        <div id="pending" hidden></div>
+        <div>
+          <div class="week-nav">
+            <button class="btn icon" id="wk-prev" aria-label="Previous week"><svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg></button>
+            <div class="lbl" id="wk-label"></div>
+            <button class="btn icon" id="wk-next" aria-label="Next week"><svg viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></svg></button>
+          </div>
+        </div>
+        <div id="week-grid" class="week-grid"></div>
+        <div class="legend" id="legend"></div>
+        <div>
+          <div class="section-head"><div><h2>Your courses</h2>
+            <p>Weekly courses get new dates queued automatically, about a week ahead.</p></div>
+            <button class="btn small" id="ics-plan">Calendar file</button></div>
+          <div class="list" id="courses"></div>
+        </div>
+      </div>
+    </section>
 
-  <main id="pages">
-    <!-- Discover -->
-    <section class="page" id="page-discover">
+    <!-- Find -->
+    <section class="page flex" id="page-find" hidden>
       <div class="split">
-        <aside class="sidebar" id="sports-pane">
+        <aside class="sidebar">
           <input type="search" id="sport-search" class="search" placeholder="Search sports">
-          <div id="sports-state" class="status-page small" hidden></div>
+          <div id="sports-state" class="status-page" hidden></div>
           <ul id="sport-list" class="nav-list"></ul>
         </aside>
-        <div class="content" id="offers-pane">
+        <div class="content">
           <div class="filters">
-            <div class="linked" id="days"></div>
+            <div class="days-pick" id="days"></div>
             <select id="f-time" aria-label="Time of day"></select>
             <select id="f-place" aria-label="Location"><option value="">All locations</option></select>
             <select id="f-level" aria-label="Level"><option value="">All levels</option></select>
             <select id="f-sport" aria-label="Sport" hidden><option value="">All sports</option></select>
             <input type="search" id="f-text" class="search" placeholder="Title, sport or trainer">
-            <button class="btn flat icon" id="offers-reload" aria-label="Reload from ASVZ">
-              <svg viewBox="0 0 16 16"><path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5v2.5h-2.5" /></svg></button>
+            <button class="btn icon" id="offers-reload" aria-label="Reload from ASVZ">
+              <svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.4-5.7M20 4v4h-4"/></svg></button>
           </div>
           <div id="summary" class="caption dim"></div>
           <div id="offers-state" class="status-page"></div>
@@ -82,71 +102,76 @@
         </div>
       </div>
       <div class="actionbar" id="selection-bar" hidden>
+        <div class="ab-row"><strong id="sel-label"></strong><button class="btn ghost small" id="sel-clear">Clear</button></div>
         <div class="ab-row">
-          <strong id="sel-label">0 offers selected</strong>
-          <button class="btn flat" id="sel-clear">Clear</button>
-        </div>
-        <div class="ab-row">
-          <label class="switch-label" title="On: sign up for every date of these offers, including dates ASVZ publishes later. Off: only the next date.">
-            Every week <input type="checkbox" class="switch" id="sel-weekly" checked></label>
-          <label class="switch-label" title="If a date is booked out, keep checking and take a place as soon as one frees up (until the lesson starts).">
-            If full, wait for a spot <input type="checkbox" class="switch" id="sel-watch" checked></label>
+          <label class="switch-label">Every week <input type="checkbox" class="switch" id="sel-weekly" checked></label>
+          <label class="switch-label">If full, wait for a spot <input type="checkbox" class="switch" id="sel-watch" checked></label>
         </div>
         <div class="ab-row end">
-          <button class="btn pill" id="sel-ics">Calendar file…</button>
-          <button class="btn pill suggested" id="sel-signup">Sign me up</button>
+          <button class="btn" id="sel-ics">Calendar file</button>
+          <button class="btn primary" id="sel-signup">Sign me up</button>
         </div>
       </div>
     </section>
 
-    <!-- My plan -->
-    <section class="page prefs" id="page-plan" hidden>
-      <div class="prefs-inner" id="plan-body"></div>
-    </section>
-
-    <!-- Activity -->
-    <section class="page prefs" id="page-activity" hidden>
-      <div class="prefs-inner">
-        <div class="group">
-          <div class="group-head"><h2>Status</h2></div>
-          <div class="boxed-list">
-            <label class="row">
+    <!-- Bot -->
+    <section class="page" id="page-bot" hidden>
+      <div class="inner narrow">
+        <div>
+          <div class="section-head"><div><h2>Bot</h2></div></div>
+          <div class="list">
+            <label class="row tap">
               <div class="row-text"><div class="row-title">Background checks</div>
-                <div class="row-sub" id="act-timer-sub">Your bot's timer: processes due sign-ups, phone or no phone</div></div>
+                <div class="row-sub" id="act-timer-sub">Your bot's timer</div></div>
               <input type="checkbox" class="switch" id="act-timer">
             </label>
             <div class="row">
-              <div class="row-text"><div class="row-title">Login</div>
-                <div class="row-sub" id="act-login">…</div></div>
-            </div>
-            <div class="row">
               <div class="row-text"><div class="row-title">Run due sign-ups now</div>
-                <div class="row-sub">Normally not needed — happens automatically</div></div>
+                <div class="row-sub" id="act-server">…</div></div>
               <button class="btn" id="act-run">Run</button>
             </div>
             <div class="row">
-              <div class="row-text"><div class="row-title">Server</div>
-                <div class="row-sub" id="act-server">…</div></div>
+              <div class="row-text"><div class="row-title">University login</div>
+                <div class="row-sub" id="act-login">…</div></div>
             </div>
           </div>
         </div>
-        <div class="group">
-          <div class="group-head"><div><h2>Bot checks</h2><p id="log-sub">Every run of the bot's timer, newest first. Tap one for its log.</p></div>
-            <button class="btn flat icon" id="log-reload" aria-label="Reload log">
-              <svg viewBox="0 0 16 16"><path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5v2.5h-2.5" /></svg></button></div>
-          <div class="boxed-list" id="runs"><div class="row"><div class="row-sub">Loading…</div></div></div>
+
+        <div>
+          <div class="section-head"><div><h2>Phone notifications</h2>
+            <p>A message when you got a spot, a course was full, or something went wrong. Via the free ntfy app.</p></div></div>
+          <div class="list" id="notify"></div>
         </div>
-        <div class="group" id="watch-group" hidden>
-          <div class="group-head"><div><h2>Free-spot watchers</h2><p>Logs of the last watchers (lessons that were full).</p></div></div>
-          <div class="boxed-list" id="watch-logs"></div>
+
+        <div>
+          <div class="section-head"><div><h2>Bot checks</h2><p>Every run of the bot's timer, newest first. Tap one for its log.</p></div>
+            <button class="btn icon" id="log-reload" aria-label="Reload log"><svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.4-5.7M20 4v4h-4"/></svg></button></div>
+          <div class="list" id="runs"><div class="row"><div class="row-sub">Loading…</div></div></div>
+        </div>
+        <div id="watch-group" hidden>
+          <div class="section-head"><div><h2>Free-spot watchers</h2><p>Logs of the last watchers (lessons that were full).</p></div></div>
+          <div class="list" id="watch-logs"></div>
+        </div>
+
+        <div>
+          <div class="section-head"><div><h2>Add a lesson by number</h2>
+            <p>Like “1) Add a lesson” in the text menu: the number from schalter.asvz.ch/tn/lessons/…</p></div></div>
+          <div class="list">
+            <form class="add-form" id="add-form">
+              <input class="field" id="add-id" inputmode="numeric" placeholder="e.g. 757666" aria-label="Lesson number">
+              <label class="switch-label">If full, wait <input type="checkbox" class="switch" id="add-watch"></label>
+              <button class="btn primary" type="submit">Add</button>
+            </form>
+          </div>
         </div>
       </div>
     </section>
   </main>
 
-  <nav class="switcher bar" id="switcher-bottom"></nav>
+  <nav class="tabbar" id="tabbar"></nav>
 </div>
 
+<div id="sheet" class="sheet-backdrop" hidden><div class="sheet" role="dialog" aria-modal="true" id="sheet-body"></div></div>
 <div id="toasts" class="toasts" aria-live="polite"></div>
 <div id="dialog" class="dialog-backdrop" hidden>
   <div class="dialog" role="alertdialog" aria-modal="true">

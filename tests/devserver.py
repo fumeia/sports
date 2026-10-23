@@ -5,6 +5,8 @@ Runs the web service against a throw-away bot folder, for trying the page
 without a server or network:  python3 tests/devserver.py /tmp/vbtest [port]
 Page login: test / test-password-123
 
+Notifications are written to <root>/ntfy.log. VB_TEST_FULL=1 makes
+"wait for a spot" jobs go to a fake watcher that gets a spot after 20 s.
 Fakes: ASVZ's lesson search (fake_asvz.py), asvz_bot.py (only writes
 enrolled.log), a stand-in scheduler with the server's file handling (or
 the real one: VB_TEST_SCHEDULER=/path/to/asvz_scheduler.py), systemctl /
@@ -64,6 +66,26 @@ import server  # noqa: E402
 import fake_asvz  # noqa: E402
 
 fake_asvz.patch(server.plan)
+
+# Notifications go to ntfy.log instead of the internet.
+_urlopen = server.week.urllib.request.urlopen
+
+
+class _Sent:
+    status = 200
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+def fake_urlopen(req, *a, **kw):
+    if getattr(req, "full_url", "").startswith(server.week.notify_settings()["server"]):
+        with open(os.path.join(root, "ntfy.log"), "a") as f:
+            f.write(req.data.decode() + "\n")
+        return _Sent()
+    return _urlopen(req, *a, **kw)
+
+
+server.week.urllib.request.urlopen = fake_urlopen
 salt = os.urandom(16)
 server.write_private(server.AUTH_FILE, {"user": "test", "salt": salt.hex(),
                                         "hash": server._scrypt("test-password-123", salt).hex()})

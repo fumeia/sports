@@ -1,14 +1,36 @@
 # vb — phone remote for the ASVZ bot
 
 A web page (installable on the phone's home screen) that controls the ASVZ
-enrollment bot **running on the server**. It has the desktop app's three
-pages: **Discover**, **My plan** and **Activity**. Enrollment still happens on
-the server, by the bot's own scheduler and its own timer, exactly as before.
-The phone only sends commands and shows status.
+enrollment bot **running on the server**. Enrollment still happens on the
+server, by the bot's own scheduler and its own timer, exactly as before. The
+phone only sends commands and shows status.
+
+- **Week**:
+  - The next sign-up with a live countdown, and whether the bot is healthy.
+  - Your week as a timeline: queued / signing up now / signed up ✓ (with place
+    number) / full, waiting for a spot / missed / failed, plus starred courses
+    you're not signed up for, shown faded. Tap one to sign up, skip, switch
+    every week on or off, star or unstar it.
+  - Below the timeline: your courses.
+- **Find**: ASVZ's lesson search (the desktop app's Discover), with ★ for
+  sports and courses. Starred sports come first, and "Starred courses" lists
+  all starred courses across sports.
+- **Bot**: the bot's timer on/off, run now, phone notifications, every run of
+  the bot (newest first, tap for its log), free-spot watchers, add a lesson by
+  number.
+- **Phone notifications** via the free ntfy app: signed up, full → watching,
+  a freed-up spot taken, missed, failed attempt, and "the bot isn't running".
+  The topic is a long random name and works like a password. Messages contain
+  course names and times only. Results come from the bot's own log lines
+  ("Job #3 finished successfully", "Your place number is: 12", the watcher's
+  "Enrollment succeeded").
 
 ```
-phone (home-screen app) ──HTTPS──▶ Caddy ──▶ vb-web (127.0.0.1:8710)
-                                                 │ edits the job list, calls the bot's own commands
+phone (home-screen app) ──HTTPS──▶ Caddy ──▶ vb-web (127.0.0.1:8710, user vb)
+                                                 │ sudo, only this:
+                                                 ▼
+                                   /usr/local/sbin/vb-bot-helper (root)
+                                                 │ job list · add · stop-watch · timer · log
                                                  ▼
    bot folder (unchanged): asvz_schedule.json · asvz_watchers.json · asvz_scheduler.py
                            asvz_scheduler.py run  ◀── the bot's existing timer
@@ -63,6 +85,8 @@ before; nothing new there.)
 |---|---|
 | `web/server.py` | The API + page server (Python standard library only). |
 | `web/asvz_plan.py` | Copy of the desktop app's lesson search / weekly plan module (release V1). |
+| `web/week.py` | Favourites, results from the bot's log, the week view, ntfy notifications. |
+| `deploy/vb-bot-helper` | The root helper (installed to `/usr/local/sbin`). |
 | `web/static/` | The page (HTML/CSS/JS, PWA manifest, service worker, icons). |
 | `deploy/inspect.sh` | **Read-only** look at how the bot runs on the server. |
 | `deploy/setup.sh` | Install / re-apply (backs up the bot folder first, changes nothing in it). |
@@ -140,7 +164,7 @@ systemctl reload caddy
 - `/usr/local/sbin/vb-bot-helper` + `/etc/vb/helper.conf` (both root-owned)
   and `/etc/sudoers.d/vb-web`: `vb` may run that helper as root, nothing
   else.
-- `/var/lib/vb/`: page login, sessions, weekly plan.
+- `/var/lib/vb/`: page login, sessions, weekly plan, favourites, results, notification settings.
 - `/etc/caddy/vb.caddy`: the site block for `vb.<domain>`. **Your Caddyfile
   is not edited.** At the end, setup prints the line to add yourself
   (`import /etc/caddy/vb.caddy`) and the `caddy validate` / `systemctl reload

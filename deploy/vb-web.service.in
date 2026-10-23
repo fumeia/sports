@@ -15,6 +15,7 @@ Environment=VB_DATA_DIR=@DATA_DIR@
 Environment=VB_PORT=@PORT@
 Environment=VB_SCHEDULER_SCRIPT=@SCHEDULER_SCRIPT@
 Environment=VB_TIMER_UNIT=@TIMER_UNIT@
+Environment=VB_PUBLIC_URL=https://@DOMAIN@
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/usr/bin/python3 @APP_DIR@/web/server.py
