@@ -380,12 +380,20 @@ def build_week(jobs, watchers, plan_entries, starred_lessons, offer_key, alive,
     entries = {e["key"]: e for e in plan_entries}
     items, have = [], set()
 
+    # Trainer per date from ASVZ (substitutes included), else the course's usual one
+    lesson_by_id = {str(l["id"]): l for l in [*planned_lessons, *starred_lessons]}
+
     def add(lesson_id, s, e, kind, **kw):
         if not s or not (start <= s < end):
             return
         lid = str(lesson_id)
         have.add(lid)
         okey = kw.get("offer_key")
+        l = lesson_by_id.get(lid)
+        kw.setdefault("instructor", ", ".join(l["instructors"]) if l and l.get("instructors")
+                      else entries.get(okey, {}).get("instructor") or None)
+        if l and not kw.get("niveau"):
+            kw["niveau"] = l.get("niveau") or None
         items.append({
             "lesson_id": lid, "start": s.isoformat(), "end": (e or s + timedelta(hours=1)).isoformat(),
             "kind": kind, "weekly": bool(entries.get(okey, {}).get("weekly")) if okey else False,
@@ -564,8 +572,10 @@ def calendar_ics(result, plan):
         if i["kind"] == "signed" and i.get("place"):
             status += f", place {i['place']}"
         mark = "✓ " if i["kind"] == "signed" else ""
+        description = "\n".join([status] + [f"{k}: {i[f]}" for k, f in
+                                             (("Trainer", "instructor"), ("Level", "niveau")) if i.get(f)])
         out += plan._event(f"lesson-{i['lesson_id']}@asvz-bot", f"{mark}ASVZ {title}",
                            plan._ics_dt(i["start"]), plan._ics_dt(i["end"]),
-                           i.get("location") or "", status, i["url"])
+                           i.get("location") or "", description, i["url"])
     out.append("END:VCALENDAR")
     return "\r\n".join(plan._fold(line) for line in out) + "\r\n"

@@ -442,6 +442,7 @@ function openSheet(it) {
   body.replaceChildren(el("div", { class: "grab" }),
     el("h3", {}, it.title || `Lesson ${it.lesson_id}`),
     el("div", { class: "meta" }, [`${shortDate(it.start)}–${hm(it.end)}`, it.location, it.niveau].filter(Boolean).join(" · ")),
+    it.instructor ? el("div", { class: "meta" }, `Trainer: ${it.instructor}`) : null,
     el("div", { class: "stline" }, icon(ic, "st " + cls), el("div", {}, status)),
     it.overlaps ? el("div", { class: "paused-note" }, `⚠ Overlaps with ${it.overlaps.join(", ")}`) : null, actions);
   const after = async () => { closeSheet(); await loadWeek(); };
