@@ -1207,6 +1207,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not c.get("enabled") or not hmac.compare_digest(token.encode(), c["token"].encode()):
             raise ApiError(404, "Not found")
         body = week.calendar_ics(week_result(starred=False), plan)
+        log.info(f"Calendar feed fetched by {self.headers.get('User-Agent', '?')[:80]!r}: "
+                 f"{body.count('BEGIN:VEVENT')} events")
         self.send(200, body, "text/calendar; charset=utf-8",
                   {"Cache-Control": "no-store", "Content-Disposition": 'inline; filename="asvz.ics"'})
 
