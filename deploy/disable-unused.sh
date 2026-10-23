@@ -29,14 +29,31 @@ h() { printf '\n===== %s =====\n' "$*"; }
 # ---- what is there
 h "systemd services"
 mapfile -t UNITS < <(
-  { systemctl list-unit-files --type=service --no-legend --plain 2>/dev/null | awk '{print $1}'
-    # running processes -> the unit they belong to (catches odd unit names)
-    for pid in $(pgrep -if "$PATTERN"); do ps -o unit= -p "$pid" 2>/dev/null; done
-  } | grep -iE "$PATTERN" | grep -E '\.service$' | grep -v '@\.service$' | sort -u)
+  { # unit files with a matching name
+    systemctl list-unit-files --type=service --no-legend --plain 2>/dev/null | awk '{print $1}' \
+      | grep -iE "$PATTERN" | grep -v '@\.service$'
+    # loaded services in a matching slice (e.g. system-jackett.slice), whatever their name
+    for u in $(systemctl list-units --all --type=service --no-legend --plain 2>/dev/null | awk '{print $1}'); do
+      systemctl show -p Slice --value "$u" 2>/dev/null | grep -qiE "$PATTERN" && echo "$u"
+    done
+    # running matching processes -> the service they belong to
+    for pid in $(pgrep -if "$PATTERN"); do
+      case "$(cat /proc/$pid/comm 2>/dev/null)" in grep|pgrep|ps) continue ;; esac
+      ps -o unit= -p "$pid" 2>/dev/null | tr -d ' '
+    done
+  } | grep -E '\.service$' | grep -vE '^(ssh|sshd|caddy|docker|containerd|asvz-scheduler|vb-web)' | sort -u)
 for u in "${UNITS[@]}"; do
-  printf '  %-40s %s, %s\n' "$u" "$(systemctl is-active "$u" 2>/dev/null)" "$(systemctl is-enabled "$u" 2>/dev/null)"
+  printf '  %-40s %s, %s  (%s)\n' "$u" "$(systemctl is-active "$u" 2>/dev/null)" \
+    "$(systemctl is-enabled "$u" 2>/dev/null)" "$(systemctl show -p FragmentPath --value "$u" 2>/dev/null)"
 done
 [ ${#UNITS[@]} -eq 0 ] && echo "  none"
+
+h "other places that could start them at boot (info)"
+{ for f in /var/spool/cron/crontabs/* /etc/crontab /etc/cron.d/* /etc/rc.local; do
+    [ -f "$f" ] && grep -HiE "$PATTERN" "$f"
+  done
+  ls -l /etc/systemd/system/*.wants/ 2>/dev/null | grep -iE "$PATTERN"
+} | sed 's/^/  /' || true
 
 h "docker containers"
 CONTAINERS=()
@@ -80,8 +97,14 @@ for u in "${UNITS[@]}"; do
   was_active="$(systemctl is-active "$u" 2>/dev/null)"
   [ "$was_enabled" = enabled ] && echo "systemctl enable $u" >> "$UNDO"
   [ "$was_active" = active ] && echo "systemctl start $u" >> "$UNDO"
-  if systemctl disable --now "$u" >/dev/null 2>&1; then echo "  off: $u"
-  else echo "  !! could not turn off $u (see: systemctl status $u)"; fi
+  if systemctl disable --now "$u" >/dev/null 2>&1 && ! systemctl is-active --quiet "$u"; then
+    echo "  off: $u"
+  elif systemctl stop "$u" >/dev/null 2>&1; then
+    echo "  stopped: $u — but it can't be disabled the usual way ($(systemctl is-enabled "$u" 2>&1)),"
+    echo "           so it may start again at boot. Send this output to Claude."
+  else
+    echo "  !! could not stop $u (see: systemctl status $u)"
+  fi
 done
 for c in "${CONTAINERS[@]}"; do
   policy="$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$c")"
