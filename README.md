@@ -113,6 +113,8 @@ before; nothing new there.)
 | `deploy/update.sh` | `git pull` + re-apply. |
 | `deploy/rollback.sh` | Remove vb again (stop the page; tells you which Caddy line to remove). |
 | `deploy/disable-unused.sh` | Turn off the unused torrent/media tools (`--undo` turns them back on). |
+| `deploy/close-ports.sh` | Obsidian/Immich only through Caddy (ports on 127.0.0.1), printer service off; `--undo`. |
+| `deploy/inspect-ports.sh` | Read-only: what's reachable from the internet. |
 | `deploy/compare-scheduler.sh` | Read-only: the server scheduler vs. the release version. |
 | `deploy/asvz-login.sh` | Only if the bot has no saved login: writes `.asvz-bot.json`. |
 | `tests/` | Fake bot, stand-in scheduler and fake ASVZ data, to try the page without a server. |
