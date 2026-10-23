@@ -19,9 +19,15 @@ phone (home-screen app) ──HTTPS──▶ Caddy ──▶ vb-web (127.0.0.1:8
   touches what the text menu touches: it adds and removes jobs in
   `asvz_schedule.json`, and calls the scheduler's own `add`, `stop-watch` and
   (through the timer) `run`.
-- **Your university login stays on the server** (`.asvz-bot.json` in the bot
-  folder). The page never reads or sends the password; it only shows
-  "user · organisation".
+- **The page can't read your university login.** It runs as its own system
+  user `vb`, which has no access to `/root` and therefore none to
+  `.asvz-bot.json`. Everything that touches the bot goes through
+  `/usr/local/sbin/vb-bot-helper` (the only thing `vb` may run as root, via
+  sudo). It has a fixed list of actions: read and write the job list, the
+  bot's own `add` / `stop-watch`, run now, timer on/off, read the bot's log.
+  It never outputs the login file; it only says whether one exists. Before
+  writing the job list it checks every job, so lesson links can only point
+  to `https://schalter.asvz.ch/tn/lessons/<number>`.
 - **The page has its own login** (name + password you choose during setup,
   stored as a scrypt hash in `/var/lib/vb/auth.json`). After 5 wrong tries from
   one address, or 20 in total, login pauses for 15 minutes. A login lasts 30 days.
@@ -116,7 +122,9 @@ systemctl reload caddy
   VB_DATA_DIR=/var/lib/vb python3 /opt/vb/web/server.py set-password
   ```
 - **Logs**, server: `journalctl -u vb-web -n 50 --no-pager` (the page). The
-  Activity page shows the bot's own run log and free-spot watcher logs.
+  Activity page shows each run of the bot's timer (newest first, refreshed
+  every 10 s while open; tap a run for its log lines) and the free-spot
+  watcher logs.
 - **Remove vb**, server:
   ```
   bash /opt/vb/deploy/rollback.sh
@@ -126,10 +134,12 @@ systemctl reload caddy
 
 - `/var/backups/vb/bot-<time>.tar.gz`: a copy of the bot folder (code, job
   list, login file; no venv or Chrome), mode 600.
-- `/etc/systemd/system/vb-web.service`: the page, on `127.0.0.1:8710`,
-  running as the bot folder's owner (it edits the bot's job list, like the
-  text menu). If the bot's timer is a system unit and that owner isn't root,
-  a sudo rule allows exactly start/enable/disable of that timer.
+- System user `vb` (no login shell, home `/var/lib/vb`).
+- `/etc/systemd/system/vb-web.service`: the page, on `127.0.0.1:8710`, as
+  user `vb`.
+- `/usr/local/sbin/vb-bot-helper` + `/etc/vb/helper.conf` (both root-owned)
+  and `/etc/sudoers.d/vb-web`: `vb` may run that helper as root, nothing
+  else.
 - `/var/lib/vb/`: page login, sessions, weekly plan.
 - `/etc/caddy/vb.caddy`: the site block for `vb.<domain>`. **Your Caddyfile
   is not edited.** At the end, setup prints the line to add yourself

@@ -10,11 +10,13 @@ existing bot on the server and offers what the desktop app (app.py) does:
   My plan    plan entries, queued sign-ups, free-spot watchers
   Activity   the bot's existing timer on/off, run now, log
 
-It never enrolls by itself and never sees the university login. It
-leaves the bot folder's code alone and only touches what the bot's own
-text menu touches: it adds/removes jobs in asvz_schedule.json and calls
-"<scheduler> add" / "stop-watch". Enrollment happens exactly as before,
-in "<scheduler> run", started by the bot's existing timer.
+It never enrolls by itself and can't see the university login: it runs
+as its own user ("vb"), which has no access to the bot folder. Everything
+that touches the bot goes through deploy/vb-bot-helper (run via sudo): read
+and write the job list (checked), the bot's own "add" / "stop-watch",
+start the bot's timer unit, read its log. The helper never hands out the
+login file. Enrollment happens exactly as before, in "<scheduler> run",
+started by the bot's existing timer.
 
 The bot's scheduler saves the whole job list at the end of every run and
 takes no lock, so a job written while a run is going could get lost.
@@ -41,6 +43,7 @@ import http.server
 import json
 import logging
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -56,27 +59,17 @@ BOT_DIR = os.path.abspath(os.environ.get("VB_BOT_DIR", "."))
 DATA_DIR = os.path.abspath(os.environ.get("VB_DATA_DIR", "/var/lib/vb"))
 HOST = os.environ.get("VB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("VB_PORT", "8710"))
-BOT_PYTHON = os.environ.get("VB_BOT_PYTHON") or sys.executable
 SCHEDULER_NAME = os.environ.get("VB_SCHEDULER_SCRIPT", "asvz_scheduler.py")
-SCHEDULER = os.path.join(BOT_DIR, SCHEDULER_NAME)
-# The bot's existing timer: <unit>.timer starts <unit>.service.
-TIMER_UNIT = os.environ.get("VB_TIMER_UNIT", "asvz-scheduler")
-TIMER_SCOPE = os.environ.get("VB_TIMER_SCOPE", "user")        # "user" or "system"
-TIMER_USER = os.environ.get("VB_TIMER_USER", "")              # owner of a user unit
+TIMER_UNIT = os.environ.get("VB_TIMER_UNIT", "asvz-scheduler")   # for display only
+HELPER = os.environ.get("VB_HELPER_CMD", "sudo -n /usr/local/sbin/vb-bot-helper").split()
 QUEUE_DAYS = int(os.environ.get("VB_QUEUE_DAYS", "8"))
 # Dev/test only: allow the session cookie over plain http://localhost.
 INSECURE_COOKIE = os.environ.get("VB_INSECURE_COOKIE") == "1"
-SYSTEMCTL = os.environ.get("VB_SYSTEMCTL", "/usr/bin/systemctl")
-JOURNALCTL = os.environ.get("VB_JOURNALCTL", "/usr/bin/journalctl")
 
 AUTH_FILE = os.path.join(DATA_DIR, "auth.json")
 SESSIONS_FILE = os.path.join(DATA_DIR, "sessions.json")
 SESSION_DAYS = 30
 COOKIE = "vb_session"
-
-CREDS_FILE = os.path.join(BOT_DIR, ".asvz-bot.json")
-WATCHERS_FILE = os.path.join(BOT_DIR, "asvz_watchers.json")
-WATCHER_LOG_DIR = os.path.join(BOT_DIR, "watcher_logs")
 
 SPORTS_TTL = 3600
 OFFERS_TTL = 600
@@ -86,10 +79,10 @@ REPAIR_WINDOW = 15 * 60
 sys.path.insert(0, HERE)
 import asvz_plan as plan  # noqa: E402  (copy of the desktop app's module)
 
-# Plan + lock in our data dir; the job list is the bot's own file.
+# Plan + lock in our data dir; the job list is the bot's own file, read
+# and written through the helper (load_schedule/save_schedule below).
 plan.PLAN_FILENAME = os.path.join(DATA_DIR, "asvz_plan.json")
 plan.SCHEDULE_LOCK = os.path.join(DATA_DIR, ".schedule.lock")
-plan.SCHEDULE_FILENAME = os.path.join(BOT_DIR, "asvz_schedule.json")
 
 _bookable = plan.bookable
 
@@ -151,65 +144,54 @@ def local_iso(naive_iso):
         return None
 
 
-def mask(username):
-    if not username:
-        return ""
-    name, at, domain = username.partition("@")
-    return (name[:2] + "…" if len(name) > 2 else name) + at + domain
+class HelperError(Exception):
+    pass
 
 
-def run(cmd, timeout=30, env=None):
+def helper(*args, stdin=None, timeout=60):
+    """Runs deploy/vb-bot-helper (as root through sudo) and returns its JSON."""
     try:
-        r = subprocess.run(cmd, cwd=BOT_DIR, capture_output=True, text=True,
-                           timeout=timeout, stdin=subprocess.DEVNULL, env=env)
-        return r.returncode, (r.stdout + r.stderr).strip()
-    except FileNotFoundError as e:
-        return 127, str(e)
+        r = subprocess.run(HELPER + [str(a) for a in args], capture_output=True, text=True,
+                           timeout=timeout, input=stdin,
+                           stdin=None if stdin is not None else subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
-        return 124, f"Timed out after {timeout}s"
+        raise HelperError(f"helper timed out ({args[0]})")
+    except OSError as e:
+        raise HelperError(f"helper not runnable: {e}")
+    try:
+        data = json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raise HelperError(f"helper failed: {(r.stderr or r.stdout).strip()[-500:]}")
+    if isinstance(data, dict) and data.get("error"):
+        raise HelperError(data["error"])
+    return data
 
 
-# ----------------------------------------------------------------------
-# the bot's existing timer
-# ----------------------------------------------------------------------
-
-def systemctl(*args, change=False):
-    if TIMER_SCOPE == "user":
-        if os.geteuid() == 0 and TIMER_USER:
-            return run([SYSTEMCTL, "--user", "-M", f"{TIMER_USER}@", *args], timeout=30)
-        return run([SYSTEMCTL, "--user", *args], timeout=30)
-    # System unit, not running as root: deploy/setup.sh's sudo rule
-    # allows exactly the changing commands used here.
-    prefix = ["sudo", "-n"] if change and os.geteuid() != 0 else []
-    return run(prefix + [SYSTEMCTL, *args], timeout=30)
+def _load_schedule():
+    return helper("read")["jobs"]
 
 
-def timer_active():
-    return systemctl("is-active", f"{TIMER_UNIT}.timer")[1].strip() == "active"
+def _save_schedule(jobs):
+    helper("write", stdin=json.dumps({"jobs": jobs}))
 
 
-def timer_next():
-    out = systemctl("show", f"{TIMER_UNIT}.timer", "--property=NextElapseUSecRealtime",
-                    "--value")[1].strip()
-    return out if out and not out.startswith("n/a") and "\n" not in out else None
+plan.load_schedule = _load_schedule
+plan.save_schedule = _save_schedule
 
 
-def journal(lines):
-    unit = f"{TIMER_UNIT}.service"
-    if TIMER_SCOPE == "user":
-        cmd = ([JOURNALCTL, "--user-unit", unit] if os.geteuid() == 0
-               else [JOURNALCTL, "--user", "-u", unit])
-    else:
-        cmd = [JOURNALCTL, "-u", unit]
-    return run(cmd + ["-n", str(lines), "--no-pager", "-o", "short-iso"], timeout=15)[1]
+def timer_status():
+    try:
+        return helper("timer", "status")
+    except HelperError as e:
+        return {"active": False, "next": None, "running": False, "error": str(e)}
 
 
 def kick_scheduler():
     """Process due jobs now (like the desktop app after "Sign me up").
     Starting the unit while it already runs does nothing, so this never
     causes two runs at once."""
-    if timer_active():
-        systemctl("start", "--no-block", f"{TIMER_UNIT}.service", change=True)
+    if timer_status().get("active"):
+        helper("run-now")
 
 
 def _boot_time():
@@ -349,6 +331,14 @@ def repair():
             plan.save_schedule(jobs)
 
 
+def sync_due():
+    p = plan.load_plan()
+    if not any(e.get("weekly") for e in p["entries"]):
+        return False
+    last = p.get("last_sync")
+    return not last or datetime.now() - datetime.fromisoformat(last) >= plan.SYNC_INTERVAL
+
+
 def background_loop():
     """Every LOOP_SECONDS, while the bot is idle: apply queued changes,
     repair, queue newly published weekly dates (throttled to 30 min
@@ -367,7 +357,7 @@ def background_loop():
                         log.info(f"Applied queued change: {label}")
                     except Exception as e:
                         log.error(f"Queued change failed ({label}): {e}")
-                if not scheduler_runs():
+                if not scheduler_runs() and sync_due():
                     n = change_now(plan.sync)
                     if n:
                         log.info(f"Weekly plan: queued {n} new date(s).")
@@ -536,8 +526,8 @@ def offers_for_keys(sport, keys):
 
 def plan_state():
     p = plan.load_plan()
-    jobs = plan.load_schedule()
-    watchers = load_json(WATCHERS_FILE, {})
+    data = helper("read")
+    jobs, watchers = data["jobs"], data["watchers"]
     out_jobs = []
     for j in sorted(jobs, key=lambda j: j.get("lesson_start", "")):
         out_jobs.append({
@@ -566,33 +556,65 @@ def plan_state():
             "last_sync": local_iso(p.get("last_sync"))}
 
 
-def credentials_status():
-    c = load_json(CREDS_FILE, {})
-    ok = all(c.get(k) for k in ("organisation", "username", "password"))
-    return {"set": ok, "organisation": c.get("organisation") if ok else None,
-            "username": mask(c.get("username")) if ok else None}
-
-
-def read_log(lines=200):
-    parts = [f"── Bot runs ({TIMER_UNIT}.service) ──", journal(lines) or "(nothing yet)"]
+def bot_info():
+    """Only whether a login is saved — the helper never says more."""
     try:
-        logs = sorted((os.path.join(WATCHER_LOG_DIR, f) for f in os.listdir(WATCHER_LOG_DIR)
-                       if f.endswith(".log")), key=os.path.getmtime)[-3:]
-    except FileNotFoundError:
-        logs = []
-    for path in logs:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            tail = f.readlines()[-60:]
-        parts += ["", f"── Free-spot watcher {os.path.basename(path)} ──", "".join(tail).rstrip()]
-    return "\n".join(parts)
+        return helper("info")
+    except HelperError:
+        return {"credentials": False, "scheduler": False}
 
 
-def bot_env():
-    env = dict(os.environ, PYTHONUNBUFFERED="1")
-    for var in ("CHROME_BIN", "CHROMEDRIVER_BIN"):
-        if os.environ.get("VB_" + var):
-            env[var] = os.environ["VB_" + var]
-    return env
+def _clean(msg):
+    # "2026-10-23 17:45:07 INFO     No scheduled jobs to run." -> "INFO No scheduled jobs to run."
+    m = re.match(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d(?:,\d+)?\s+(\w+)\s+(.*)$", msg)
+    return f"{m.group(1)} {m.group(2)}" if m else msg
+
+
+OUTCOMES = [  # first match wins, checked over the whole run
+    ("error", re.compile(r"Traceback|ERROR|failed with error|Failed to spawn", re.I), "Error"),
+    ("enrolled", re.compile(r"finished successfully", re.I), "Signed up"),
+    ("watching", re.compile(r"detached watcher", re.I), "Waiting for a free spot"),
+    ("missed", re.compile(r"missed the window", re.I), "Missed"),
+    ("enrolling", re.compile(r"Executing job|Starting job", re.I), "Enrolling"),
+    ("idle", re.compile(r"No scheduled jobs", re.I), "Nothing queued"),
+]
+
+
+def runs_from_journal(entries):
+    """Groups the scheduler unit's journal into runs (one per timer tick),
+    newest first, each with a one-word outcome."""
+    runs, cur = [], None
+    for e in entries:
+        msg = e["msg"].strip()
+        if e.get("who") == "systemd":
+            if msg.startswith("Starting"):
+                cur = {"start": e["t"], "end": None, "lines": []}
+                runs.append(cur)
+            elif msg.startswith(("Finished", "Failed", "Stopped")) and cur:
+                cur["end"] = e["t"]
+                cur["failed_unit"] = msg.startswith("Failed")
+                cur = None
+            continue
+        if cur is None:
+            cur = {"start": e["t"], "end": None, "lines": []}
+            runs.append(cur)
+        cur["lines"].append({"t": e["t"], "msg": _clean(msg), "prio": e.get("prio", 6)})
+    out = []
+    for r in runs:
+        text = "\n".join(l["msg"] for l in r["lines"])
+        kind, label = "checked", "Checked — nothing due yet"
+        if r.get("failed_unit") or any(l["prio"] <= 3 for l in r["lines"]):
+            kind, label = "error", "Error"
+        else:
+            for k, rx, lab in OUTCOMES:
+                if rx.search(text):
+                    kind, label = k, lab
+                    break
+        detail = next((l["msg"] for l in reversed(r["lines"])
+                       if re.search(r"job|lesson|enroll|error|missed", l["msg"], re.I)), "")
+        out.append({"start": r["start"], "end": r["end"], "kind": kind, "label": label,
+                    "detail": detail, "lines": r["lines"]})
+    return out[::-1]
 
 
 BUSY_TEXT = ("The bot is busy with a run right now (up to ~20 minutes while it waits for an "
@@ -719,6 +741,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send(200, result if result is not None else {"ok": True})
         except ApiError as e:
             self.send(e.status, {"error": str(e)})
+        except HelperError as e:
+            log.error(f"Helper: {e}")
+            self.send(502, {"error": f"Server helper: {e}"})
         except Exception as e:  # report, don't kill the thread silently
             log.exception("Request failed")
             self.send(500, {"error": f"{type(e).__name__}: {e}"})
@@ -762,32 +787,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # ---- status / activity
     def api_get_status(self, q):
+        t, info = timer_status(), bot_info()
         return {
             "server_time": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "timer": timer_active(), "timer_next": timer_next(),
-            "timer_unit": f"{TIMER_UNIT}.timer", "running": bool(scheduler_runs()),
-            "pending": len(PENDING), "credentials": credentials_status(), "bot_dir": BOT_DIR,
-            "scheduler_ok": os.path.isfile(SCHEDULER),
+            "timer": t.get("active"), "timer_next": t.get("next"), "helper_error": t.get("error"),
+            "timer_unit": f"{TIMER_UNIT}.timer",
+            "running": bool(scheduler_runs()) or bool(t.get("running")),
+            "pending": len(PENDING), "credentials": {"set": info.get("credentials")},
+            "bot_dir": BOT_DIR, "scheduler_ok": info.get("scheduler"),
         }
 
     def api_get_log(self, q):
-        return {"text": read_log()}
+        try:
+            data = helper("log", "600")
+        except HelperError as e:
+            raise ApiError(502, str(e))
+        return {"runs": runs_from_journal(data["journal"])[:80], "watchers": data["watchers"],
+                "running": bool(scheduler_runs())}
 
     def api_post_timer(self, b):
         on = bool(b.get("on"))
-        code, out = systemctl("enable" if on else "disable", "--now", f"{TIMER_UNIT}.timer",
-                              change=True)
-        if code:
-            raise ApiError(500, out or "systemctl failed")
-        return {"timer": timer_active(),
+        try:
+            t = helper("timer", "on" if on else "off")
+        except HelperError as e:
+            raise ApiError(500, str(e))
+        return {"timer": t.get("active"),
                 "message": "Background checks on: due sign-ups are processed automatically again."
                 if on else "Background checks off: the bot signs up for nothing until you turn them on."}
 
     def api_post_run(self, b):
-        code, out = systemctl("start", "--no-block", f"{TIMER_UNIT}.service", change=True)
-        if code:
-            raise ApiError(500, out or "systemctl failed")
-        return {"message": "Check started"}
+        r = helper("run-now")
+        if r.get("code"):
+            raise ApiError(500, r.get("output") or "systemctl failed")
+        return {"message": "Check started", "started": int(time.time() * 1000)}
 
     # ---- discover
     def api_get_sports(self, q):
@@ -815,7 +847,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return offers
 
     def api_post_signup(self, b):
-        if not credentials_status()["set"]:
+        if not bot_info().get("credentials"):
             raise ApiError(409, "The bot has no ASVZ login on the server yet. "
                                 "Set it there first (see README).")
         offers = plan.complete_offers(self._chosen(b))  # network: before taking any lock
@@ -893,19 +925,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             lesson_id = lesson_id.rstrip("/").rsplit("/", 1)[-1]
         if not lesson_id.isdigit() or len(lesson_id) > 10:
             raise ApiError(400, "Lesson number: digits only, e.g. 757666")
-        if not credentials_status()["set"]:
+        if not bot_info().get("credentials"):
             raise ApiError(409, "The bot has no ASVZ login on the server yet.")
         if lesson_id in _ids(plan.load_schedule()):
             raise ApiError(409, f"Lesson {lesson_id} is already queued.")
-        cmd = [BOT_PYTHON, SCHEDULER, "add", lesson_id]
-        if b.get("watch"):
-            cmd += ["--watch-free-slot", "--watch-poll-interval", "30"]
+        args = ["add", lesson_id] + (["watch"] if b.get("watch") else [])
         with WRITE_LOCK:
             if scheduler_runs():
                 raise ApiError(409, "The bot is busy with a run right now. Try again in a few "
                                     "minutes (nothing was added).")
-            out = change_now(lambda: run(cmd, timeout=240, env=bot_env()))
-        code, text = out
+            out = change_now(lambda: helper(*args, timeout=260))
+        code, text = out.get("code"), out.get("output", "")
         if code:
             raise ApiError(502, "Couldn't add the lesson:\n" + text[-1500:])
         kick_scheduler()
@@ -916,8 +946,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             job_id = int(b.get("id"))
         except (TypeError, ValueError):
             raise ApiError(400, "Bad job id")
-        code, out = run([BOT_PYTHON, SCHEDULER, "stop-watch", str(job_id)], timeout=60,
-                        env=bot_env())
+        out = helper("stop-watch", job_id, timeout=70).get("output", "")
         return {"message": out.strip().splitlines()[-1] if out.strip() else "Watcher stopped"}
 
 
@@ -935,11 +964,14 @@ def main():
     os.makedirs(DATA_DIR, exist_ok=True)
     if not load_json(AUTH_FILE, {}).get("hash"):
         log.warning("No page password yet: run 'server.py set-password'. Nobody can log in.")
-    if not os.path.isfile(SCHEDULER):
-        log.error(f"Scheduler not found: {SCHEDULER}")
+    try:
+        if not helper("info").get("scheduler"):
+            log.error("The helper can't find the bot's scheduler script.")
+    except HelperError as e:
+        log.error(f"Helper not working: {e}")
     threading.Thread(target=background_loop, daemon=True).start()
     log.info(f"vb listening on http://{HOST}:{PORT} (bot folder {BOT_DIR}, "
-             f"timer {TIMER_UNIT}.timer [{TIMER_SCOPE}])")
+             f"timer {TIMER_UNIT}.timer)")
     Server((HOST, PORT), Handler).serve_forever()
 
 

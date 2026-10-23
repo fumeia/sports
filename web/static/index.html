@@ -131,10 +131,14 @@
           </div>
         </div>
         <div class="group">
-          <div class="group-head"><div><h2>Log</h2></div>
+          <div class="group-head"><div><h2>Bot checks</h2><p id="log-sub">Every run of the bot's timer, newest first. Tap one for its log.</p></div>
             <button class="btn flat icon" id="log-reload" aria-label="Reload log">
               <svg viewBox="0 0 16 16"><path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5v2.5h-2.5" /></svg></button></div>
-          <pre class="log-view" id="log-view">…</pre>
+          <div class="boxed-list" id="runs"><div class="row"><div class="row-sub">Loading…</div></div></div>
+        </div>
+        <div class="group" id="watch-group" hidden>
+          <div class="group-head"><div><h2>Free-spot watchers</h2><p>Logs of the last watchers (lessons that were full).</p></div></div>
+          <div class="boxed-list" id="watch-logs"></div>
         </div>
       </div>
     </section>

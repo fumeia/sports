@@ -11,7 +11,9 @@
 # What it does:
 #   1. finds the bot folder, its venv, its scheduler script and its timer
 #   2. backs up the bot folder's code + data  -> /var/backups/vb/
-#   3. installs vb-web.service on 127.0.0.1 (runs as the bot's user)
+#   3. installs vb-web.service on 127.0.0.1 as its own user "vb" (no access
+#      to the bot folder) + /usr/local/sbin/vb-bot-helper, the only thing vb
+#      may run as root (sudo rule); the helper does the bot actions
 #   4. writes /etc/caddy/vb.caddy (your Caddyfile is not edited: you add
 #      the import line yourself; setup prints it)
 set -euo pipefail
@@ -159,7 +161,7 @@ if [ "$UPDATE" -eq 0 ]; then
   echo
   echo "  Bot folder : $BOT_DIR — nothing in it is changed"
   echo "  Bot timer  : $TIMER_UNIT.timer — stays; the page can start it / turn it on or off"
-  echo "  Page       : https://$DOMAIN  ->  127.0.0.1:$PORT (vb-web, runs as $BOT_USER)"
+  echo "  Page       : https://$DOMAIN  ->  127.0.0.1:$PORT (vb-web, user vb: no access to the bot folder)"
   echo
   read -rp "Go ahead? Type yes: " answer
   [ "$answer" = "yes" ] || die "Stopped, nothing changed."
@@ -174,59 +176,83 @@ chmod 600 "$BK"
 ok "Backup of the bot folder (code + job list + login file): $BK"
 
 # ---------------------------------------------------------------- 3. vb-web
+# The page runs as its own system user "vb", which can't open the bot
+# folder (and so not the login file). It reaches the bot only through
+# /usr/local/sbin/vb-bot-helper, run as root via a sudo rule.
+if ! id vb >/dev/null 2>&1; then
+  useradd --system --user-group --home-dir "$DATA_DIR" --no-create-home --shell /usr/sbin/nologin vb
+  ok "Created system user vb"
+fi
 mkdir -p "$DATA_DIR"
 chmod 700 "$DATA_DIR"
-cat > "$CONF" <<EOF
-SAVED_BOT_DIR='$BOT_DIR'
-SAVED_DOMAIN='$DOMAIN'
-SAVED_PORT='$PORT'
-EOF
+printf "SAVED_BOT_DIR='%s'\nSAVED_DOMAIN='%s'\nSAVED_PORT='%s'\n" "$BOT_DIR" "$DOMAIN" "$PORT" > "$CONF"
+
+put() {  # new-file target [mode] -> 0 if changed (old one backed up)
+  if [ -f "$2" ] && cmp -s "$1" "$2"; then rm -f "$1"; return 1; fi
+  [ -f "$2" ] && cp -p "$2" "$BACKUP_ROOT/$(basename "$2").$TS"
+  mv "$1" "$2"; chown root:root "$2"; chmod "${3:-644}" "$2"; return 0
+}
+
+# helper + its settings (root-owned: vb can't change what they point to)
+mkdir -p /etc/vb && chmod 755 /etc/vb
+tmp="$(mktemp)"
+{
+  echo "# Installed by vb deploy/setup.sh — read by /usr/local/sbin/vb-bot-helper."
+  echo "BOT_DIR=$BOT_DIR"
+  echo "BOT_PYTHON=$BOT_PYTHON"
+  echo "SCHEDULER_SCRIPT=$SCHEDULER_SCRIPT"
+  echo "TIMER_UNIT=$TIMER_UNIT"
+  echo "TIMER_SCOPE=$TIMER_SCOPE"
+  echo "TIMER_USER=$BOT_USER"
+  echo "CHROME_BIN=$CHROME_BIN"
+  echo "CHROMEDRIVER_BIN=$CHROMEDRIVER_BIN"
+} > "$tmp"
+put "$tmp" /etc/vb/helper.conf 644 || true
+tmp="$(mktemp)"; cp "$APP_DIR/deploy/vb-bot-helper" "$tmp"
+if put "$tmp" /usr/local/sbin/vb-bot-helper 755; then ok "Installed /usr/local/sbin/vb-bot-helper"; fi
+
+SUDO_TMP="$(mktemp)"
+{
+  echo "# Installed by vb deploy/setup.sh: the phone page (user vb) may run the"
+  echo "# helper as root — nothing else. The helper checks its own arguments."
+  echo "Defaults:vb !pam_session, !log_allowed"
+  echo "vb ALL=(root) NOPASSWD: /usr/local/sbin/vb-bot-helper"
+} > "$SUDO_TMP"
+if ! visudo -cf "$SUDO_TMP" >/dev/null 2>&1; then
+  # older sudo without log_allowed: same rule, sudo then logs each call
+  sed -i 's/^Defaults:vb .*/Defaults:vb !pam_session/' "$SUDO_TMP"
+  visudo -cf "$SUDO_TMP" >/dev/null || die "sudoers check failed"
+fi
+chmod 440 "$SUDO_TMP"
+if [ -f /etc/sudoers.d/vb-web ] && cmp -s "$SUDO_TMP" /etc/sudoers.d/vb-web; then
+  rm -f "$SUDO_TMP"
+else
+  [ -f /etc/sudoers.d/vb-web ] && cp -p /etc/sudoers.d/vb-web "$BACKUP_ROOT/sudoers-vb-web.$TS"
+  mv "$SUDO_TMP" /etc/sudoers.d/vb-web; chown root:root /etc/sudoers.d/vb-web
+  ok "sudo rule /etc/sudoers.d/vb-web (vb may run only the helper)"
+fi
+if ! sudo -u vb sudo -n /usr/local/sbin/vb-bot-helper info >/dev/null 2>&1; then
+  die "The helper doesn't work for user vb. Send the output of: sudo -u vb sudo -n /usr/local/sbin/vb-bot-helper info"
+fi
+ok "Helper works for user vb"
 
 render() {  # template -> stdout (values passed as env vars, not pasted into code)
-  local extra=""
-  [ -n "$CHROME_BIN" ] && extra="Environment=VB_CHROME_BIN=$CHROME_BIN"
-  [ -n "$CHROMEDRIVER_BIN" ] && extra="$extra"$'\n'"Environment=VB_CHROMEDRIVER_BIN=$CHROMEDRIVER_BIN"
-  # A non-root user talks to its own systemd user manager through this.
-  if [ "$TIMER_SCOPE" = user ] && [ "$BOT_USER" != root ]; then
-    extra="$extra"$'\n'"Environment=XDG_RUNTIME_DIR=/run/user/$BOT_UID"
-  fi
-  R_BOT_USER="$BOT_USER" R_BOT_DIR="$BOT_DIR" R_BOT_PYTHON="$BOT_PYTHON" R_APP_DIR="$APP_DIR" \
-  R_DATA_DIR="$DATA_DIR" R_PORT="$PORT" R_DOMAIN="$DOMAIN" R_SCHEDULER_SCRIPT="$SCHEDULER_SCRIPT" \
-  R_TIMER_UNIT="$TIMER_UNIT" R_TIMER_SCOPE="$TIMER_SCOPE" R_EXTRA_ENV="$extra" python3 -c '
+  R_BOT_DIR="$BOT_DIR" R_APP_DIR="$APP_DIR" R_DATA_DIR="$DATA_DIR" R_PORT="$PORT" R_DOMAIN="$DOMAIN" \
+  R_SCHEDULER_SCRIPT="$SCHEDULER_SCRIPT" R_TIMER_UNIT="$TIMER_UNIT" python3 -c '
 import os, re, sys
 s = open(sys.argv[1]).read()
 s = re.sub(r"@([A-Z_]+)@", lambda m: os.environ["R_" + m.group(1)], s)
 sys.stdout.write(re.sub(r"\n{3,}", "\n\n", s))' "$1"
 }
 
-put() {  # new-file target  -> 0 if changed (old one backed up)
-  if [ -f "$2" ] && cmp -s "$1" "$2"; then rm -f "$1"; return 1; fi
-  [ -f "$2" ] && cp -p "$2" "$BACKUP_ROOT/$(basename "$2").$TS"
-  mv "$1" "$2"; chmod 644 "$2"; return 0
-}
-
 tmp="$(mktemp)"; render "$APP_DIR/deploy/vb-web.service.in" > "$tmp"; put "$tmp" /etc/systemd/system/vb-web.service || true
 systemctl daemon-reload
-
-if [ "$TIMER_SCOPE" = system ] && [ "$BOT_USER" != root ]; then
-  SUDO_TMP="$(mktemp)"
-  cat > "$SUDO_TMP" <<EOF
-# Installed by vb deploy/setup.sh: lets the phone page start / switch the bot's timer, nothing else.
-$BOT_USER ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block $TIMER_UNIT.service, /usr/bin/systemctl enable --now $TIMER_UNIT.timer, /usr/bin/systemctl disable --now $TIMER_UNIT.timer
-EOF
-  visudo -cf "$SUDO_TMP" >/dev/null || die "sudoers check failed"
-  install -m 440 "$SUDO_TMP" /etc/sudoers.d/vb-web; rm -f "$SUDO_TMP"
-  ok "sudo rule /etc/sudoers.d/vb-web (only start/enable/disable of $TIMER_UNIT)"
-fi
-if [ "$BOT_USER" != root ]; then
-  usermod -aG systemd-journal "$BOT_USER"   # read the bot's log for the Activity page
-fi
 
 if ! python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["hash"]' "$DATA_DIR/auth.json" 2>/dev/null; then
   info "Choose the login for the phone page (not your university login):"
   VB_DATA_DIR="$DATA_DIR" python3 "$APP_DIR/web/server.py" set-password
 fi
-chown -R "$BOT_USER" "$DATA_DIR"
+chown -R vb:vb "$DATA_DIR"
 
 systemctl enable vb-web >/dev/null 2>&1
 systemctl restart vb-web
@@ -235,7 +261,7 @@ for _ in $(seq 1 20); do
   sleep 0.5
 done
 curl -fsS "http://127.0.0.1:$PORT/api/me" >/dev/null || die "vb-web did not start. See: journalctl -u vb-web -n 50 --no-pager"
-ok "vb-web running on 127.0.0.1:$PORT"
+ok "vb-web running on 127.0.0.1:$PORT as user vb"
 
 # ---------------------------------------------------------------- 4. Caddy
 # Only our own file /etc/caddy/vb.caddy is written. The Caddyfile is never

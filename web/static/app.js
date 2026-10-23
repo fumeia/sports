@@ -104,7 +104,9 @@ function zurichWeekday() { return (["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]).
 
 function toast(text, ms = 4000) {
   const t = el("div", { class: "toast" + (text.length > 60 ? " long" : "") }, text);
-  $("#toasts").append(t);
+  const box = $("#toasts");
+  while (box.children.length >= 2) box.firstChild.remove();  // keep at most two on screen
+  box.append(t);
   setTimeout(() => t.remove(), ms);
 }
 
@@ -205,8 +207,11 @@ function refreshAll() {
 function tick() {
   if (document.hidden) return;
   if (state.page === "plan") refreshPlan(true);
-  else if (state.page === "activity") refreshStatus();
 }
+// The Activity page follows the bot live.
+setInterval(() => {
+  if (!document.hidden && started && state.page === "activity") { refreshStatus(); loadLog(); }
+}, 10000);
 
 function buildSwitchers() {
   const pages = [["discover", "Discover"], ["plan", "My plan"], ["activity", "Activity"]];
@@ -269,9 +274,9 @@ async function refreshStatus() {
     $("#act-timer-sub").textContent = `Your bot's timer (${s.timer_unit}): processes due sign-ups, phone or no phone`;
     const c = s.credentials;
     $("#act-login").textContent = c.set
-      ? `${c.username} · ${c.organisation} · stored on the server only`
-      : "Not set up on the server yet — see README (“ASVZ login”).";
-    const next = s.timer_next && s.timer && !s.timer_next.startsWith("n/a") ? ` · next check ${s.timer_next}` : "";
+      ? "Saved on the server. This page can't read it — only whether it exists."
+      : "No login saved on the server yet — see README (“ASVZ login”).";
+    const next = s.timer && s.timer_next ? ` · next check ${clock(s.timer_next).slice(0, 5)} (${countdown(new Date(s.timer_next).toISOString())})` : "";
     const t = new Date(s.server_time);
     $("#act-server").textContent = (s.running ? "The bot is running a check now" : "Idle") + next +
       (s.pending ? ` · ${plural(s.pending, "change")} waiting` : "") +
@@ -295,19 +300,63 @@ async function setTimer(on) {
 $("#act-timer").addEventListener("change", (ev) => setTimer(ev.target.checked));
 
 $("#act-run").addEventListener("click", (ev) => busy(ev.currentTarget, async () => {
-  try { await api("run", {}); toast("Check started"); setTimeout(loadLog, 5000); }
-  catch (e) { toast(e.message); }
+  let r;
+  try { r = await api("run", {}); } catch (e) { toast(e.message); return; }
+  toast("Check started");
+  // Follow that run until it has finished (a sign-up can take up to ~20 min;
+  // after a minute we stop waiting here, the list keeps updating anyway).
+  for (let i = 0; i < 30; i++) {
+    await new Promise((ok) => setTimeout(ok, 2000));
+    const log = await loadLog();
+    const run = log && log.runs.find((x) => x.start >= r.started - 3000);
+    if (run && run.end) { toast(`Check done: ${run.label}`); return; }
+  }
 }));
 
+const RUN_KIND = { error: "full", missed: "full", enrolled: "ok", watching: "", enrolling: "", idle: "dim", checked: "dim" };
+const openRuns = new Set();
+
+function ago(ms) {
+  const s = Math.max(0, Math.round((now() - ms) / 1000));
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
+  return `${Math.floor(s / 86400)} d ago`;
+}
+function clock(ms) {
+  return new Date(ms).toLocaleTimeString("en-GB", { timeZone: ZURICH, hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
 async function loadLog() {
-  const view = $("#log-view");
-  try {
-    const r = await api("log");
-    const atBottom = view.scrollTop + view.clientHeight >= view.scrollHeight - 20;
-    view.textContent = r.text;
-    if (atBottom || view.dataset.loaded !== "1") view.scrollTop = view.scrollHeight;
-    view.dataset.loaded = "1";
-  } catch (e) { view.textContent = e.message; }
+  let r;
+  try { r = await api("log"); }
+  catch (e) { $("#runs").replaceChildren(el("div", { class: "row" }, el("div", { class: "row-sub" }, e.message))); return null; }
+  const list = $("#runs");
+  list.replaceChildren();
+  if (!r.runs.length) list.append(el("div", { class: "row" }, el("div", { class: "row-sub" }, "No runs in the log yet.")));
+  for (const run of r.runs.slice(0, 40)) {
+    const key = String(run.start);
+    const lines = el("pre", { class: "log-view run-lines" }, run.lines.map((l) => `${clock(l.t)}  ${l.msg}`).join("\n") || "(no output)");
+    lines.hidden = !openRuns.has(key);
+    const label = run.end ? run.label : "Running…";
+    const row = el("div", { class: "row activatable run", role: "button", tabindex: "0",
+      onclick: () => { lines.hidden = !lines.hidden; if (lines.hidden) openRuns.delete(key); else openRuns.add(key); } },
+      el("div", { class: "row-text" },
+        el("div", { class: "row-title" }, el("b", { class: "tnum" }, clock(run.start).slice(0, 5)), "  ", el("span", { class: "dim caption" }, ago(run.start))),
+        run.detail && run.kind !== "idle" ? el("div", { class: "row-sub" }, run.detail) : null),
+      el("span", { class: "pill-label " + (run.end ? RUN_KIND[run.kind] ?? "" : "") }, label));
+    list.append(el("div", {}, row, lines));
+  }
+  const wl = $("#watch-logs");
+  wl.replaceChildren();
+  $("#watch-group").hidden = !r.watchers.length;
+  for (const w of r.watchers) {
+    const pre = el("pre", { class: "log-view run-lines" }, w.text || "(empty)");
+    pre.hidden = true;
+    wl.append(el("div", {}, el("div", { class: "row activatable", role: "button", tabindex: "0", onclick: () => { pre.hidden = !pre.hidden; } },
+      el("div", { class: "row-text" }, el("div", { class: "row-title" }, w.name), el("div", { class: "row-sub" }, `last written ${ago(w.modified)}`))), pre));
+  }
+  return r;
 }
 $("#log-reload").addEventListener("click", loadLog);
 

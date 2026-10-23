@@ -1,0 +1,234 @@
+#!/usr/bin/python3 -I
+# coding: utf-8
+"""
+vb-bot-helper — the only way the phone page (user "vb") reaches the bot.
+
+Installed by deploy/setup.sh as /usr/local/sbin/vb-bot-helper (root,
+0755); a sudo rule lets user vb run it as root. vb itself can't open
+/root, so it can't read the bot's login file. This helper does a fixed
+set of things and never prints that file:
+
+    info                      {"credentials": true/false, "scheduler": true/false}
+    read                      the job list + watcher registry
+    write                     replace the job list with stdin {"jobs": [...]} (checked)
+    add LESSON [watch]        the bot's own "add" (reads the lesson page)
+    stop-watch JOB            the bot's own "stop-watch"
+    run-now                   start one scheduler run via the bot's timer unit
+    timer status|on|off       the bot's timer
+    log [LINES]               the scheduler unit's journal + watcher log tails
+
+Settings come from /etc/vb/helper.conf (root-owned), never from the caller.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime
+
+# Called through sudo (the real thing), nothing comes from the environment
+# (sudo clears it anyway). The overrides exist only for the sandbox tests,
+# which run the helper directly with VB_HELPER_TEST=1.
+_TEST = os.environ.get("VB_HELPER_TEST") == "1" and "SUDO_USER" not in os.environ
+CONF = os.environ.get("VB_HELPER_CONF", "/etc/vb/helper.conf") if _TEST else "/etc/vb/helper.conf"
+SYSTEMCTL = os.environ.get("VB_SYSTEMCTL", "/usr/bin/systemctl") if _TEST else "/usr/bin/systemctl"
+JOURNALCTL = os.environ.get("VB_JOURNALCTL", "/usr/bin/journalctl") if _TEST else "/usr/bin/journalctl"
+LESSON_URL = re.compile(r"^https://schalter\.asvz\.ch/tn/lessons/(\d{1,10})$")
+JOB_KEYS = {"id", "type", "lesson_id", "lesson_url", "enrollment_start", "lesson_start",
+            "lesson_end", "run_at", "enroll_until", "created_at", "watch_free_slot",
+            "watch_poll_interval", "title", "location", "niveau", "offer_key", "source"}
+TIME_KEYS = ("enrollment_start", "lesson_start", "lesson_end", "run_at", "enroll_until", "created_at")
+
+
+def fail(msg, code=2):
+    print(json.dumps({"error": msg}))
+    sys.exit(code)
+
+
+def conf():
+    c = {}
+    try:
+        with open(CONF, encoding="utf-8") as f:
+            for line in f:
+                k, sep, v = line.strip().partition("=")
+                if sep and not k.startswith("#"):
+                    c[k.strip()] = v.strip()
+    except OSError as e:
+        fail(f"can't read {CONF}: {e}")
+    for k in ("BOT_DIR", "BOT_PYTHON", "SCHEDULER_SCRIPT", "TIMER_UNIT", "TIMER_SCOPE"):
+        if not c.get(k):
+            fail(f"{k} missing in {CONF}")
+    return c
+
+
+C = conf()
+BOT = C["BOT_DIR"]
+SCHEDULE = os.path.join(BOT, "asvz_schedule.json")
+WATCHERS = os.path.join(BOT, "asvz_watchers.json")
+
+
+def out(obj):
+    print(json.dumps(obj, ensure_ascii=False))
+
+
+def load(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return default
+
+
+def systemctl(*args):
+    cmd = [SYSTEMCTL]
+    if C["TIMER_SCOPE"] == "user":
+        cmd += ["--user", "-M", f"{C.get('TIMER_USER') or 'root'}@"]
+    r = subprocess.run(cmd + list(args), capture_output=True, text=True, timeout=30)
+    return r.returncode, (r.stdout + r.stderr).strip()
+
+
+def bot(*args, timeout=240):
+    env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONUNBUFFERED": "1",
+           "HOME": os.path.expanduser("~root"), "LANG": "C.UTF-8"}
+    for k in ("CHROME_BIN", "CHROMEDRIVER_BIN"):
+        if C.get(k):
+            env[k] = C[k]
+    try:
+        r = subprocess.run([C["BOT_PYTHON"], os.path.join(BOT, C["SCHEDULER_SCRIPT"]), *args],
+                           cwd=BOT, env=env, capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except subprocess.TimeoutExpired:
+        return 124, f"timed out after {timeout}s"
+
+
+def check_job(j):
+    if not isinstance(j, dict) or set(j) - JOB_KEYS:
+        raise ValueError(f"unexpected fields: {sorted(set(j) - JOB_KEYS) if isinstance(j, dict) else j}")
+    if not isinstance(j.get("id"), int) or j.get("type") != "lesson":
+        raise ValueError("bad id/type")
+    lid = str(j.get("lesson_id", ""))
+    m = LESSON_URL.match(str(j.get("lesson_url", "")))
+    if not lid.isdigit() or not m or m.group(1) != lid:
+        raise ValueError(f"lesson link must be https://schalter.asvz.ch/tn/lessons/{lid}")
+    for k in TIME_KEYS:
+        if k in j:
+            datetime.fromisoformat(str(j[k]))
+    for k in ("enrollment_start", "lesson_start", "run_at"):
+        if k not in j:
+            raise ValueError(f"{k} missing")
+    if not isinstance(j.get("watch_free_slot", False), bool):
+        raise ValueError("bad watch_free_slot")
+    poll = j.get("watch_poll_interval", 30)
+    if not isinstance(poll, int) or not 5 <= poll <= 3600:
+        raise ValueError("bad watch_poll_interval")
+    for k in ("title", "location", "niveau", "offer_key", "source"):
+        if k in j and (not isinstance(j[k], str) or len(j[k]) > 400):
+            raise ValueError(f"bad {k}")
+
+
+def write_jobs():
+    try:
+        data = json.loads(sys.stdin.read(2_000_000))
+        jobs = data["jobs"]
+        if not isinstance(jobs, list) or len(jobs) > 500:
+            raise ValueError("jobs must be a list (max 500)")
+        for j in jobs:
+            check_job(j)
+        if len({j["id"] for j in jobs}) != len(jobs):
+            raise ValueError("duplicate job ids")
+    except (ValueError, KeyError, TypeError) as e:
+        fail(f"job list refused: {e}")
+    st = os.stat(SCHEDULE) if os.path.exists(SCHEDULE) else None
+    tmp = SCHEDULE + ".vb-tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"jobs": jobs}, f, indent=2)
+    if st:
+        os.chown(tmp, st.st_uid, st.st_gid)
+        os.chmod(tmp, st.st_mode & 0o777)
+    os.replace(tmp, SCHEDULE)
+    out({"ok": True, "jobs": len(jobs)})
+
+
+def journal(lines):
+    unit = f"{C['TIMER_UNIT']}.service"
+    sel = ["--user-unit", unit] if C["TIMER_SCOPE"] == "user" else ["-u", unit]
+    r = subprocess.run([JOURNALCTL, *sel, "-n", str(lines), "--no-pager", "-o", "json",
+                        "--output-fields=MESSAGE,_PID,SYSLOG_IDENTIFIER,PRIORITY"],
+                       capture_output=True, text=True, timeout=20)
+    entries = []
+    for line in r.stdout.splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        msg = e.get("MESSAGE")
+        if isinstance(msg, list):  # journald stores non-UTF-8 as a byte list
+            msg = bytes(msg).decode(errors="replace")
+        entries.append({"t": int(e.get("__REALTIME_TIMESTAMP", 0)) // 1000, "msg": msg or "",
+                        "pid": e.get("_PID"), "who": e.get("SYSLOG_IDENTIFIER"),
+                        "prio": int(e.get("PRIORITY", 6))})
+    return entries
+
+
+def watcher_logs():
+    d = os.path.join(BOT, "watcher_logs")
+    try:
+        files = sorted((os.path.join(d, f) for f in os.listdir(d) if f.endswith(".log")),
+                       key=os.path.getmtime)[-5:]
+    except FileNotFoundError:
+        return []
+    res = []
+    for p in reversed(files):
+        with open(p, encoding="utf-8", errors="replace") as f:
+            res.append({"name": os.path.basename(p), "modified": int(os.path.getmtime(p) * 1000),
+                        "text": "".join(f.readlines()[-80:])})
+    return res
+
+
+def main():
+    a = sys.argv[1:]
+    if not a:
+        fail("no command")
+    cmd = a[0]
+    if cmd == "info" and len(a) == 1:
+        creds = load(os.path.join(BOT, ".asvz-bot.json"), {})
+        out({"credentials": all(creds.get(k) for k in ("organisation", "username", "password")),
+             "scheduler": os.path.isfile(os.path.join(BOT, C["SCHEDULER_SCRIPT"]))})
+    elif cmd == "read" and len(a) == 1:
+        out({"jobs": load(SCHEDULE, {}).get("jobs", []), "watchers": load(WATCHERS, {})})
+    elif cmd == "write" and len(a) == 1:
+        write_jobs()
+    elif cmd == "add" and len(a) in (2, 3) and a[1].isdigit() and len(a[1]) <= 10 \
+            and (len(a) == 2 or a[2] == "watch"):
+        args = ["add", a[1]] + (["--watch-free-slot", "--watch-poll-interval", "30"] if len(a) == 3 else [])
+        code, text = bot(*args)
+        out({"code": code, "output": text[-3000:]})
+    elif cmd == "stop-watch" and len(a) == 2 and a[1].isdigit() and len(a[1]) <= 6:
+        code, text = bot("stop-watch", a[1], timeout=60)
+        out({"code": code, "output": text[-2000:]})
+    elif cmd == "run-now" and len(a) == 1:
+        code, text = systemctl("start", "--no-block", f"{C['TIMER_UNIT']}.service")
+        out({"code": code, "output": text})
+    elif cmd == "timer" and len(a) == 2 and a[1] in ("status", "on", "off"):
+        t = f"{C['TIMER_UNIT']}.timer"
+        if a[1] != "status":
+            code, text = systemctl("enable" if a[1] == "on" else "disable", "--now", t)
+            if code:
+                fail(text or "systemctl failed")
+        active = systemctl("is-active", t)[1] == "active"
+        nxt = systemctl("show", t, "--property=NextElapseUSecRealtime", "--value",
+                        "--timestamp=unix")[1]
+        busy = systemctl("is-active", f"{C['TIMER_UNIT']}.service")[1] in ("active", "activating")
+        out({"active": active, "next": int(nxt[1:]) * 1000 if re.fullmatch(r"@\d+", nxt) else None,
+             "running": busy})
+    elif cmd == "log" and len(a) <= 2 and (len(a) == 1 or a[1].isdigit()):
+        lines = min(int(a[1]) if len(a) == 2 else 400, 3000)
+        out({"journal": journal(lines), "watchers": watcher_logs()})
+    else:
+        fail("unknown command")
+
+
+if __name__ == "__main__":
+    main()

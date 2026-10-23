@@ -1,2 +1,0 @@
-#!/bin/sh
-echo "2026-10-23T16:58:00+0200 vb asvz_scheduler: INFO No scheduled jobs to run. (fake journal)"

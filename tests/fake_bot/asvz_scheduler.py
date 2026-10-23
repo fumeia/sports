@@ -6,6 +6,7 @@ no lock, so changes made meanwhile are overwritten. "add" and
 "stop-watch" behave like the real commands."""
 import argparse
 import json
+import logging
 import os
 import signal
 import time
@@ -36,6 +37,9 @@ def main():
     s = sub.add_parser("stop-watch")
     s.add_argument("job_id", type=int)
     args = p.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%S")
+    logging.info("Loaded credentials from local store")
 
     if args.command == "add":
         enroll, lesson = AsvzEnroller._AsvzEnroller__get_enrollment_and_start_time(None)
@@ -52,6 +56,8 @@ def main():
         print(f"Added job {jobs[-1]['id']}: lesson {args.lesson_id}")
     elif args.command == "run":
         jobs, now, remaining = load(), datetime.now(), []
+        if not jobs:
+            logging.info("No scheduled jobs to run.")
         time.sleep(float(os.environ.get("VB_TEST_RUN_SECONDS", "0")))
         for j in jobs:
             if now < datetime.fromisoformat(j["run_at"]):
@@ -60,9 +66,11 @@ def main():
             cutoff = (datetime.fromisoformat(j["lesson_start"]) if j.get("watch_free_slot")
                       else datetime.fromisoformat(j["enrollment_start"]) + timedelta(minutes=5))
             if now > cutoff:
-                print(f"missed {j['lesson_id']}")
+                logging.info(f"[schedule run] Job #{j['id']} missed the window, removing.")
                 continue
+            logging.info(f"[schedule run] Executing job #{j['id']} for lesson {j['lesson_id']}")
             AsvzEnroller(j["lesson_url"], {}).enroll()
+            logging.info(f"[schedule run] Job #{j['id']} finished successfully.")
         save(remaining)
     elif args.command == "stop-watch":
         w = json.load(open("asvz_watchers.json"))
