@@ -1,18 +1,10 @@
 # coding: utf-8
 """Stand-in for the real asvz_bot.py in sandbox tests: same names the
 scheduler imports, but no Chrome and no ASVZ login. "Enrolling" appends
-a line to enrolled.log. Also points asvz_plan at the fake ASVZ API."""
+a line to enrolled.log."""
 import json
 import os
-import sys
 from datetime import datetime, timedelta
-
-sys.path.insert(0, os.environ.get("VB_TEST_DIR", ""))
-try:
-    import fake_asvz, asvz_plan
-    fake_asvz.patch(asvz_plan)
-except ImportError:
-    pass
 
 LESSON_BASE_URL = "https://schalter.asvz.ch"
 CREDENTIALS_FILENAME = ".asvz-bot.json"

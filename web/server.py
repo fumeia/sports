@@ -4,17 +4,28 @@
 server.py — "vb", the phone remote for the ASVZ bot.
 
 A small HTTP service (standard library only) that runs next to the
-existing bot on the server and does what the desktop app (app.py) does:
+existing bot on the server and offers what the desktop app (app.py) does:
 
   Discover   ASVZ's public lesson search, weekly offers, "Sign me up"
   My plan    plan entries, queued sign-ups, free-spot watchers
-  Activity   background checks (the vb-scheduler timer), run now, log
+  Activity   the bot's existing timer on/off, run now, log
 
-It never enrolls by itself and never sees the university login: it
-writes the same files as the desktop app (asvz_plan.json,
-asvz_schedule.json, through asvz_plan.py from the bot folder) and calls
-the same scheduler commands. Enrollment happens in
-"asvz_scheduler.py run", started by the vb-scheduler timer.
+It never enrolls by itself and never sees the university login. It
+leaves the bot folder's code alone and only touches what the bot's own
+text menu touches: it adds/removes jobs in asvz_schedule.json and calls
+"<scheduler> add" / "stop-watch". Enrollment happens exactly as before,
+in "<scheduler> run", started by the bot's existing timer.
+
+The bot's scheduler saves the whole job list at the end of every run and
+takes no lock, so a job written while a run is going could get lost.
+Hence every change is applied only while no run is active (otherwise it
+waits, see Pending), and for 15 minutes after a change it is checked
+again and repaired if a run that started at the same moment undid it.
+
+Weekly plans (asvz_plan.py, from the desktop app) live in the data dir,
+not in the bot folder. New dates are queued by this service, only about
+a week ahead (QUEUE_DAYS), so the job list stays as short as when you
+added them by hand every Sunday.
 
 Listens on 127.0.0.1 only; Caddy puts HTTPS in front. The page has its
 own login (scrypt password hash in the data dir, 30-day session cookie).
@@ -46,7 +57,13 @@ DATA_DIR = os.path.abspath(os.environ.get("VB_DATA_DIR", "/var/lib/vb"))
 HOST = os.environ.get("VB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("VB_PORT", "8710"))
 BOT_PYTHON = os.environ.get("VB_BOT_PYTHON") or sys.executable
-SCHED_UNIT = os.environ.get("VB_SCHEDULER_UNIT", "vb-scheduler")
+SCHEDULER_NAME = os.environ.get("VB_SCHEDULER_SCRIPT", "asvz_scheduler.py")
+SCHEDULER = os.path.join(BOT_DIR, SCHEDULER_NAME)
+# The bot's existing timer: <unit>.timer starts <unit>.service.
+TIMER_UNIT = os.environ.get("VB_TIMER_UNIT", "asvz-scheduler")
+TIMER_SCOPE = os.environ.get("VB_TIMER_SCOPE", "user")        # "user" or "system"
+TIMER_USER = os.environ.get("VB_TIMER_USER", "")              # owner of a user unit
+QUEUE_DAYS = int(os.environ.get("VB_QUEUE_DAYS", "8"))
 # Dev/test only: allow the session cookie over plain http://localhost.
 INSECURE_COOKIE = os.environ.get("VB_INSECURE_COOKIE") == "1"
 SYSTEMCTL = os.environ.get("VB_SYSTEMCTL", "/usr/bin/systemctl")
@@ -60,19 +77,32 @@ COOKIE = "vb_session"
 CREDS_FILE = os.path.join(BOT_DIR, ".asvz-bot.json")
 WATCHERS_FILE = os.path.join(BOT_DIR, "asvz_watchers.json")
 WATCHER_LOG_DIR = os.path.join(BOT_DIR, "watcher_logs")
-SCHEDULER = os.path.join(BOT_DIR, "asvz_scheduler.py")
 
 SPORTS_TTL = 3600
 OFFERS_TTL = 600
+LOOP_SECONDS = 15
+REPAIR_WINDOW = 15 * 60
 
-sys.path.insert(0, BOT_DIR)
-try:
-    import asvz_plan as plan  # the bot's own module (installed by deploy/setup.sh)
-except ImportError as e:  # reported by /api/status, the page shows it
-    plan = None
-    PLAN_IMPORT_ERROR = str(e)
-else:
-    PLAN_IMPORT_ERROR = None
+sys.path.insert(0, HERE)
+import asvz_plan as plan  # noqa: E402  (copy of the desktop app's module)
+
+# Plan + lock in our data dir; the job list is the bot's own file.
+plan.PLAN_FILENAME = os.path.join(DATA_DIR, "asvz_plan.json")
+plan.SCHEDULE_LOCK = os.path.join(DATA_DIR, ".schedule.lock")
+plan.SCHEDULE_FILENAME = os.path.join(BOT_DIR, "asvz_schedule.json")
+
+_bookable = plan.bookable
+
+
+def _bookable_soon(lessons, now=None):
+    """Like asvz_plan.bookable, but only dates whose enrollment opens
+    within QUEUE_DAYS. Later dates get queued by a later sync."""
+    horizon = (now or datetime.now().astimezone()) + timedelta(days=QUEUE_DAYS)
+    return [l for l in _bookable(lessons, now)
+            if (l["oe_from"] or l["start"] - timedelta(days=1)) <= horizon]
+
+
+plan.bookable = _bookable_soon
 
 log = logging.getLogger("vb")
 
@@ -139,33 +169,211 @@ def run(cmd, timeout=30, env=None):
         return 124, f"Timed out after {timeout}s"
 
 
-def systemctl(*args):
-    """Start/stop our own units. As root directly; otherwise through the
-    sudo rule deploy/setup.sh installs for exactly these commands."""
-    prefix = [] if os.geteuid() == 0 else ["sudo", "-n"]
+# ----------------------------------------------------------------------
+# the bot's existing timer
+# ----------------------------------------------------------------------
+
+def systemctl(*args, change=False):
+    if TIMER_SCOPE == "user":
+        if os.geteuid() == 0 and TIMER_USER:
+            return run([SYSTEMCTL, "--user", "-M", f"{TIMER_USER}@", *args], timeout=30)
+        return run([SYSTEMCTL, "--user", *args], timeout=30)
+    # System unit, not running as root: deploy/setup.sh's sudo rule
+    # allows exactly the changing commands used here.
+    prefix = ["sudo", "-n"] if change and os.geteuid() != 0 else []
     return run(prefix + [SYSTEMCTL, *args], timeout=30)
 
 
 def timer_active():
-    code, out = run([SYSTEMCTL, "is-active", f"{SCHED_UNIT}.timer"], timeout=10)
-    return out.strip() == "active"
+    return systemctl("is-active", f"{TIMER_UNIT}.timer")[1].strip() == "active"
 
 
 def timer_next():
-    code, out = run([SYSTEMCTL, "show", f"{SCHED_UNIT}.timer",
-                     "--property=NextElapseUSecRealtime", "--value"], timeout=10)
-    return out.strip() or None
+    out = systemctl("show", f"{TIMER_UNIT}.timer", "--property=NextElapseUSecRealtime",
+                    "--value")[1].strip()
+    return out if out and not out.startswith("n/a") and "\n" not in out else None
 
 
-def scheduler_busy():
-    code, out = run([SYSTEMCTL, "is-active", f"{SCHED_UNIT}.service"], timeout=10)
-    return out.strip() in ("active", "activating")
+def journal(lines):
+    unit = f"{TIMER_UNIT}.service"
+    if TIMER_SCOPE == "user":
+        cmd = ([JOURNALCTL, "--user-unit", unit] if os.geteuid() == 0
+               else [JOURNALCTL, "--user", "-u", unit])
+    else:
+        cmd = [JOURNALCTL, "-u", unit]
+    return run(cmd + ["-n", str(lines), "--no-pager", "-o", "short-iso"], timeout=15)[1]
 
 
 def kick_scheduler():
-    """Process due jobs now (like the desktop app after "Sign me up")."""
+    """Process due jobs now (like the desktop app after "Sign me up").
+    Starting the unit while it already runs does nothing, so this never
+    causes two runs at once."""
     if timer_active():
-        systemctl("start", "--no-block", f"{SCHED_UNIT}.service")
+        systemctl("start", "--no-block", f"{TIMER_UNIT}.service", change=True)
+
+
+def _boot_time():
+    with open("/proc/stat") as f:
+        for line in f:
+            if line.startswith("btime"):
+                return int(line.split()[1])
+    return 0
+
+
+def scheduler_runs():
+    """[(pid, start_unix_time)] of running "<scheduler> run" processes —
+    started by the timer, "Run now", or by hand. (Option 4 of the text
+    menu runs inside the menu process and can't be told apart; it's the
+    same situation as using the menu while the timer runs.)"""
+    found = []
+    tick = os.sysconf("SC_CLK_TCK")
+    boot = None
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                args = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+        except OSError:
+            continue
+        for i, a in enumerate(args):
+            if os.path.basename(a) == SCHEDULER_NAME and "run" in args[i + 1:]:
+                try:
+                    with open(f"/proc/{pid}/stat") as f:
+                        ticks = int(f.read().rsplit(")", 1)[1].split()[19])
+                    boot = boot if boot is not None else _boot_time()
+                    found.append((int(pid), boot + ticks / tick))
+                except (OSError, ValueError, IndexError):
+                    found.append((int(pid), 0))
+                break
+    return found
+
+
+# ----------------------------------------------------------------------
+# changing the job list safely (see module docstring)
+# ----------------------------------------------------------------------
+
+WRITE_LOCK = threading.RLock()
+PENDING = []      # [(label, fn)] waiting for the running scheduler pass to end
+EXPECT = {}       # str(lesson_id) -> {"until", "present", "job"}  (repair window)
+
+
+def _ids(jobs):
+    return {str(j.get("lesson_id")): j for j in jobs}
+
+
+def _after_change(before, started):
+    """Bookkeeping after one of our changes to the job list:
+    - drop jobs we just added for a lesson that was already queued
+      (e.g. added by number in the text menu — ids there are strings),
+    - jobs added while enrollment is already open: set enrollment_start
+      to now, because the bot drops non-watch jobs 5 minutes after it,
+    - remember what we changed, to repair it if a run undid it."""
+    with plan.schedule_lock():
+        jobs = plan.load_schedule()
+        old = {j["id"] for j in before}
+        old_lessons = {str(j.get("lesson_id")) for j in before}
+        now = datetime.now()
+        keep, changed = [], False
+        for j in jobs:
+            if j["id"] not in old and str(j.get("lesson_id")) in old_lessons:
+                changed = True
+                continue
+            if (j["id"] not in old and not j.get("watch_free_slot")
+                    and datetime.fromisoformat(j["enrollment_start"]) < now):
+                j["enrollment_start"] = now.isoformat(timespec="minutes")
+                changed = True
+            keep.append(j)
+        if changed:
+            plan.save_schedule(keep)
+            jobs = keep
+    b, a = _ids(before), _ids(jobs)
+    until = time.time() + REPAIR_WINDOW
+    for lid in a.keys() - b.keys():
+        EXPECT[lid] = {"until": until, "present": True, "job": a[lid]}
+    for lid in b.keys() - a.keys():
+        EXPECT[lid] = {"until": until, "present": False, "job": b[lid]}
+    if any(t < started for _, t in scheduler_runs()):
+        log.warning("A scheduler run started while we changed the job list — will re-check after it.")
+
+
+def change_now(fn):
+    """Runs fn (which edits the job list through asvz_plan) while no
+    scheduler pass is active. Returns fn's result."""
+    with WRITE_LOCK:
+        before = plan.load_schedule()
+        started = time.time()
+        result = fn()
+        _after_change(before, started)
+        return result
+
+
+def change(label, fn):
+    """Apply now if the bot is idle, else queue it. Returns
+    (applied, result)."""
+    with WRITE_LOCK:
+        if not scheduler_runs() and not PENDING:
+            return True, change_now(fn)
+        PENDING.append((label, fn))
+        log.info(f"Bot is busy — queued: {label}")
+        return False, None
+
+
+def repair():
+    """Re-apply our recent changes that a scheduler run overwrote."""
+    now_ts, now = time.time(), datetime.now()
+    for lid in [k for k, e in EXPECT.items() if e["until"] < now_ts]:
+        del EXPECT[lid]
+    if not EXPECT:
+        return
+    with plan.schedule_lock():
+        jobs = plan.load_schedule()
+        have = _ids(jobs)
+        changed = False
+        for lid, e in EXPECT.items():
+            if e["present"] and lid not in have:
+                job = e["job"]
+                # Gone because it ran (enrolled / handed to a watcher) is fine;
+                # only put back what wasn't due yet.
+                if datetime.fromisoformat(job["run_at"]) > now + timedelta(minutes=1):
+                    job = dict(job, id=max((j["id"] for j in jobs), default=0) + 1)
+                    jobs.append(job)
+                    e["job"] = job
+                    changed = True
+                    log.warning(f"Re-added lesson {lid}: a scheduler run had overwritten it.")
+            elif not e["present"] and lid in have:
+                jobs = [j for j in jobs if str(j.get("lesson_id")) != lid]
+                changed = True
+                log.warning(f"Removed lesson {lid} again: a scheduler run had put it back.")
+        if changed:
+            plan.save_schedule(jobs)
+
+
+def background_loop():
+    """Every LOOP_SECONDS, while the bot is idle: apply queued changes,
+    repair, queue newly published weekly dates (throttled to 30 min
+    inside asvz_plan.sync)."""
+    while True:
+        time.sleep(LOOP_SECONDS)
+        try:
+            with WRITE_LOCK:
+                if scheduler_runs():
+                    continue
+                repair()
+                while PENDING and not scheduler_runs():
+                    label, fn = PENDING.pop(0)
+                    try:
+                        change_now(fn)
+                        log.info(f"Applied queued change: {label}")
+                    except Exception as e:
+                        log.error(f"Queued change failed ({label}): {e}")
+                if not scheduler_runs():
+                    n = change_now(plan.sync)
+                    if n:
+                        log.info(f"Weekly plan: queued {n} new date(s).")
+                        kick_scheduler()
+        except Exception:
+            log.exception("Background loop")
 
 
 # ----------------------------------------------------------------------
@@ -303,7 +511,7 @@ def get_offers(sport, force=False):
 
 
 def offer_json(o):
-    nxt = plan.next_bookable(o)
+    nxt = next(iter(_bookable(o["lessons"])), None)
     return {
         "key": o["key"], "sport_id": o["sport_id"], "sport_name": o["sport_name"],
         "title": o["title"], "weekday": o["weekday"], "start": o["start"], "end": o["end"],
@@ -327,7 +535,7 @@ def offers_for_keys(sport, keys):
 # ----------------------------------------------------------------------
 
 def plan_state():
-    entries = plan.load_plan()["entries"]
+    p = plan.load_plan()
     jobs = plan.load_schedule()
     watchers = load_json(WATCHERS_FILE, {})
     out_jobs = []
@@ -352,9 +560,10 @@ def plan_state():
     out_entries = [{k: e.get(k) for k in ("key", "sport_name", "title", "weekday", "start",
                                           "end", "location", "niveau", "instructor",
                                           "weekly", "watch")}
-                   for e in sorted(entries, key=lambda e: (e["weekday"], e["start"]))]
+                   for e in sorted(p["entries"], key=lambda e: (e["weekday"], e["start"]))]
     return {"entries": out_entries, "jobs": out_jobs, "watchers": out_watchers,
-            "last_sync": local_iso(plan.load_plan().get("last_sync"))}
+            "pending": [label for label, _ in PENDING], "queue_days": QUEUE_DAYS,
+            "last_sync": local_iso(p.get("last_sync"))}
 
 
 def credentials_status():
@@ -365,10 +574,7 @@ def credentials_status():
 
 
 def read_log(lines=200):
-    parts = [f"── Background checks (journalctl -u {SCHED_UNIT}) ──"]
-    code, out = run([JOURNALCTL, "-u", f"{SCHED_UNIT}.service", "-n", str(lines),
-                     "--no-pager", "-o", "short-iso"], timeout=15)
-    parts.append(out or "(nothing yet)")
+    parts = [f"── Bot runs ({TIMER_UNIT}.service) ──", journal(lines) or "(nothing yet)"]
     try:
         logs = sorted((os.path.join(WATCHER_LOG_DIR, f) for f in os.listdir(WATCHER_LOG_DIR)
                        if f.endswith(".log")), key=os.path.getmtime)[-3:]
@@ -387,6 +593,10 @@ def bot_env():
         if os.environ.get("VB_" + var):
             env[var] = os.environ["VB_" + var]
     return env
+
+
+BUSY_TEXT = ("The bot is busy with a run right now (up to ~20 minutes while it waits for an "
+             "enrollment to open). Saved — it's applied as soon as the run is done.")
 
 
 # ----------------------------------------------------------------------
@@ -502,9 +712,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 raise ApiError(404, "Not found")
             if name not in ("post_login", "get_me") and not SESSIONS.valid(self.cookie(COOKIE)):
                 raise ApiError(401, "Please log in")
-            if PLAN_IMPORT_ERROR and name not in ("post_login", "get_me", "post_logout",
-                                                  "get_status", "get_log"):
-                raise ApiError(503, f"asvz_plan.py missing in the bot folder: {PLAN_IMPORT_ERROR}")
             result = handler(self.body() if method == "POST" else query)
             if isinstance(result, tuple):  # (status, body, ctype, headers)
                 self.send(*result)
@@ -557,9 +764,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def api_get_status(self, q):
         return {
             "server_time": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "timer": timer_active(), "timer_next": timer_next(), "running": scheduler_busy(),
-            "credentials": credentials_status(), "bot_dir": BOT_DIR,
-            "plan_error": PLAN_IMPORT_ERROR,
+            "timer": timer_active(), "timer_next": timer_next(),
+            "timer_unit": f"{TIMER_UNIT}.timer", "running": bool(scheduler_runs()),
+            "pending": len(PENDING), "credentials": credentials_status(), "bot_dir": BOT_DIR,
+            "scheduler_ok": os.path.isfile(SCHEDULER),
         }
 
     def api_get_log(self, q):
@@ -567,15 +775,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def api_post_timer(self, b):
         on = bool(b.get("on"))
-        code, out = systemctl("enable" if on else "disable", "--now", f"{SCHED_UNIT}.timer")
+        code, out = systemctl("enable" if on else "disable", "--now", f"{TIMER_UNIT}.timer",
+                              change=True)
         if code:
             raise ApiError(500, out or "systemctl failed")
         return {"timer": timer_active(),
-                "message": "Background checks on: due sign-ups are processed every 2 minutes."
-                if on else "Background checks off: nothing gets signed up until you turn them on."}
+                "message": "Background checks on: due sign-ups are processed automatically again."
+                if on else "Background checks off: the bot signs up for nothing until you turn them on."}
 
     def api_post_run(self, b):
-        code, out = systemctl("start", "--no-block", f"{SCHED_UNIT}.service")
+        code, out = systemctl("start", "--no-block", f"{TIMER_UNIT}.service", change=True)
         if code:
             raise ApiError(500, out or "systemctl failed")
         return {"message": "Check started"}
@@ -609,9 +818,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not credentials_status()["set"]:
             raise ApiError(409, "The bot has no ASVZ login on the server yet. "
                                 "Set it there first (see README).")
-        offers = self._chosen(b)
+        offers = plan.complete_offers(self._chosen(b))  # network: before taking any lock
         weekly, watch = bool(b.get("weekly")), bool(b.get("watch"))
-        count, messages = plan.add_offers(offers, weekly, watch)
+        applied, result = change(f"Sign up: {', '.join(o['title'] for o in offers)}",
+                                 lambda: plan.add_offers(offers, weekly, watch))
+        if not applied:
+            return {"offers": len(offers), "queued": 0, "messages": [], "pending": True,
+                    "message": BUSY_TEXT}
+        count, messages = result
         kick_scheduler()
         return {"offers": len(offers), "queued": count, "messages": messages}
 
@@ -628,41 +842,52 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def api_get_plan(self, q):
         return plan_state()
 
+    def _changed(self, applied, done_text):
+        return {"pending": not applied, "message": done_text if applied else BUSY_TEXT}
+
     def api_post_plan_weekly(self, b):
         key, weekly = str(b.get("key", "")), bool(b.get("weekly"))
-        plan.set_weekly(key, weekly)
-        n = 0
-        if weekly:
-            try:
-                n = plan.sync(force=True)
-            except Exception as e:
-                return {"queued": 0, "message": f"Saved, but couldn't reach ASVZ: {e}"}
+
+        def go():
+            plan.set_weekly(key, weekly)
+            return plan.sync(force=True) if weekly else 0
+        try:
+            applied, n = change("Every week " + ("on" if weekly else "off"), go)
+        except Exception as e:
+            return {"message": f"Saved, but couldn't reach ASVZ: {e}"}
+        if applied and n:
             kick_scheduler()
-        return {"queued": n}
+        return self._changed(applied, f"{n} new date(s) queued" if n else "")
 
     def api_post_plan_remove(self, b):
-        return {"removed_jobs": plan.remove_entry(str(b.get("key", "")))}
+        key = str(b.get("key", ""))
+        applied, n = change("Remove offer", lambda: plan.remove_entry(key))
+        return self._changed(applied, f"Removed" + (f" with {n} queued date(s)" if n else ""))
 
     def api_post_plan_sync(self, b):
+        if scheduler_runs():
+            return {"queued": 0, "message": "The bot is busy with a run; new dates are looked "
+                                            "for automatically right after it."}
         try:
-            n = plan.sync(force=True)
+            n = change_now(lambda: plan.sync(force=True))
         except Exception as e:
             raise ApiError(502, f"Couldn't reach ASVZ: {e}")
         if n:
             kick_scheduler()
-        return {"queued": n}
+        return {"queued": n, "message": f"{n} new date(s) queued" if n else
+                f"Up to date — dates are queued about {QUEUE_DAYS} days ahead"}
 
     def api_post_jobs_remove(self, b):
         try:
             job_id = int(b.get("id"))
         except (TypeError, ValueError):
             raise ApiError(400, "Bad job id")
-        plan.remove_job(job_id)
-        return {"ok": True}
+        applied, _ = change("Skip a date", lambda: plan.remove_job(job_id))
+        return self._changed(applied, "Date skipped")
 
     def api_post_jobs_add(self, b):
-        """The text menu's "1) Add a lesson": by lesson number, read from
-        the lesson page with Chrome (takes ~10–30 s)."""
+        """The text menu's "1) Add a lesson": by lesson number, through the
+        bot's own scheduler (reads the lesson page with Chrome, ~10–30 s)."""
         lesson_id = str(b.get("lesson_id", "")).strip()
         if "/lessons/" in lesson_id:
             lesson_id = lesson_id.rstrip("/").rsplit("/", 1)[-1]
@@ -670,14 +895,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise ApiError(400, "Lesson number: digits only, e.g. 757666")
         if not credentials_status()["set"]:
             raise ApiError(409, "The bot has no ASVZ login on the server yet.")
+        if lesson_id in _ids(plan.load_schedule()):
+            raise ApiError(409, f"Lesson {lesson_id} is already queued.")
         cmd = [BOT_PYTHON, SCHEDULER, "add", lesson_id]
         if b.get("watch"):
             cmd += ["--watch-free-slot", "--watch-poll-interval", "30"]
-        code, out = run(cmd, timeout=240, env=bot_env())
+        with WRITE_LOCK:
+            if scheduler_runs():
+                raise ApiError(409, "The bot is busy with a run right now. Try again in a few "
+                                    "minutes (nothing was added).")
+            out = change_now(lambda: run(cmd, timeout=240, env=bot_env()))
+        code, text = out
         if code:
-            raise ApiError(502, "Couldn't add the lesson:\n" + out[-1500:])
+            raise ApiError(502, "Couldn't add the lesson:\n" + text[-1500:])
         kick_scheduler()
-        return {"message": out.strip().splitlines()[-1] if out.strip() else "Added"}
+        return {"message": text.strip().splitlines()[-1] if text.strip() else "Added"}
 
     def api_post_watchers_stop(self, b):
         try:
@@ -703,9 +935,11 @@ def main():
     os.makedirs(DATA_DIR, exist_ok=True)
     if not load_json(AUTH_FILE, {}).get("hash"):
         log.warning("No page password yet: run 'server.py set-password'. Nobody can log in.")
-    if PLAN_IMPORT_ERROR:
-        log.error(f"asvz_plan.py not found in {BOT_DIR}: {PLAN_IMPORT_ERROR}")
-    log.info(f"vb listening on http://{HOST}:{PORT} (bot folder {BOT_DIR})")
+    if not os.path.isfile(SCHEDULER):
+        log.error(f"Scheduler not found: {SCHEDULER}")
+    threading.Thread(target=background_loop, daemon=True).start()
+    log.info(f"vb listening on http://{HOST}:{PORT} (bot folder {BOT_DIR}, "
+             f"timer {TIMER_UNIT}.timer [{TIMER_SCOPE}])")
     Server((HOST, PORT), Handler).serve_forever()
 
 

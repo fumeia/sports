@@ -1,6 +1,6 @@
 # Installed by deploy/setup.sh — the phone page + API (127.0.0.1 only;
 # Caddy adds HTTPS). Runs as the bot's user because it edits the bot's
-# files, like the desktop app does.
+# job list and calls the bot's own scheduler, like the text menu does.
 [Unit]
 Description=vb: phone remote for the ASVZ bot
 After=network-online.target
@@ -13,8 +13,11 @@ Environment=VB_BOT_DIR=@BOT_DIR@
 Environment=VB_DATA_DIR=@DATA_DIR@
 Environment=VB_PORT=@PORT@
 Environment=VB_BOT_PYTHON=@BOT_PYTHON@
-Environment=VB_SCHEDULER_UNIT=vb-scheduler
-@VB_CHROME_ENV@
+Environment=VB_SCHEDULER_SCRIPT=@SCHEDULER_SCRIPT@
+Environment=VB_TIMER_UNIT=@TIMER_UNIT@
+Environment=VB_TIMER_SCOPE=@TIMER_SCOPE@
+Environment=VB_TIMER_USER=@BOT_USER@
+@EXTRA_ENV@
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 @APP_DIR@/web/server.py
 Restart=on-failure

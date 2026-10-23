@@ -6,15 +6,13 @@
 #                                             deploy/update.sh calls this)
 # Options: --bot-dir DIR  --domain vb.example.com  --port 8710
 #
-# What it does (nothing is deleted; replaced files are backed up first):
-#   1. finds the bot folder and checks its files are a version we know
+# The bot itself is left exactly as it is: no file in the bot folder is
+# replaced, added or chmod-ed, and its timer stays the one that runs it.
+# What it does:
+#   1. finds the bot folder, its venv, its scheduler script and its timer
 #   2. backs up the bot folder's code + data  -> /var/backups/vb/
-#   3. puts the desktop app's asvz_scheduler.py + asvz_plan.py and a
-#      server keep_awake.py into the bot folder (asvz_bot.py is untouched)
-#   4. installs vb-scheduler.timer (the 2-minute check, as a system service)
-#      and turns off the old per-user asvz-scheduler.timer (files kept)
-#   5. installs vb-web.service on 127.0.0.1 and /etc/caddy/vb.caddy,
-#      runs caddy validate, reloads Caddy
+#   3. installs vb-web.service on 127.0.0.1 (runs as the bot's user)
+#   4. installs /etc/caddy/vb.caddy, runs caddy validate, reloads Caddy
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -23,7 +21,8 @@ CONF="$DATA_DIR/setup.conf"
 BACKUP_ROOT=/var/backups/vb
 TS="$(date +%Y%m%d-%H%M%S)"
 
-# sha256 of bot files we know (from the "Server version" and "V1" releases)
+# sha256 of the files in the "Server version" release, to say whether the
+# server still runs that version (informational only).
 SHA_BOT_KNOWN="422454b03640cde353cf21197d678495ce2c7154d0fcfc511d38e9c1c8e032d7"
 SHA_SCHED_SERVER="67844f836b60bf5a443371ef5807c82b31cad43c1ea3d6b0de178f8d833af6ed"
 
@@ -57,7 +56,7 @@ BOT_DIR="${BOT_DIR:-${SAVED_BOT_DIR:-}}"
 DOMAIN="${DOMAIN:-${SAVED_DOMAIN:-}}"
 PORT="${PORT:-${SAVED_PORT:-8710}}"
 
-# ---------------------------------------------------------------- 1. bot folder
+# ---------------------------------------------------------------- 1. find the bot
 if [ -z "$BOT_DIR" ]; then
   info "Looking for the bot folder…"
   mapfile -t cands < <(find / -xdev -name asvz_bot.py -not -path '*/venv/*' -not -path '*/.venv/*' \
@@ -70,13 +69,15 @@ fi
 BOT_DIR="$(readlink -f "$BOT_DIR")"
 [ -f "$BOT_DIR/asvz_bot.py" ] || die "$BOT_DIR has no asvz_bot.py"
 BOT_USER="$(stat -c %U "$BOT_DIR")"
+BOT_UID="$(id -u "$BOT_USER")"
 ok "Bot folder: $BOT_DIR (owner $BOT_USER)"
 
-SCHED="$BOT_DIR/asvz_scheduler.py"
-if [ ! -f "$SCHED" ]; then
-  [ -f "$BOT_DIR/asvz-scheduler.py" ] && die "Found asvz-scheduler.py (with a dash), not asvz_scheduler.py. Send the inspect.sh output to Claude before going on."
-  die "$SCHED not found"
-fi
+SCHEDULER_SCRIPT=""
+for s in asvz_scheduler.py asvz-scheduler.py; do
+  [ -f "$BOT_DIR/$s" ] && { SCHEDULER_SCRIPT="$s"; break; }
+done
+[ -n "$SCHEDULER_SCRIPT" ] || die "No asvz_scheduler.py in $BOT_DIR"
+ok "Scheduler: $SCHEDULER_SCRIPT (left unchanged)"
 
 BOT_PYTHON=""
 for v in "$BOT_DIR/.venv" "$BOT_DIR/venv" "$BOT_DIR/../.venv" "$BOT_DIR/../venv"; do
@@ -87,47 +88,54 @@ done
 ok "Bot Python: $BOT_PYTHON"
 
 sha() { sha256sum "$1" | cut -d' ' -f1; }
-NEW_SCHED_SHA="$(sha "$APP_DIR/bot/asvz_scheduler.py")"
-CUR_SCHED_SHA="$(sha "$SCHED")"
-if [ "$(sha "$BOT_DIR/asvz_bot.py")" != "$SHA_BOT_KNOWN" ]; then
-  die "asvz_bot.py on this server differs from the version in the releases. The new scheduler might not fit it. Send the inspect.sh output to Claude."
+VERSION_NOTE=""
+[ "$(sha "$BOT_DIR/asvz_bot.py")" = "$SHA_BOT_KNOWN" ] || VERSION_NOTE="asvz_bot.py"
+[ "$(sha "$BOT_DIR/$SCHEDULER_SCRIPT")" = "$SHA_SCHED_SERVER" ] || VERSION_NOTE="$VERSION_NOTE $SCHEDULER_SCRIPT"
+if [ -n "$VERSION_NOTE" ]; then
+  warn "Differs from the 'Server version' release:$VERSION_NOTE — fine if it's your newer working copy;"
+  warn "the page only uses its 'add', 'stop-watch' and 'run' commands and the job list."
 fi
-case "$CUR_SCHED_SHA" in
-  "$NEW_SCHED_SHA") SCHED_ACTION=keep ;;
-  "$SHA_SCHED_SERVER") SCHED_ACTION=replace ;;
-  *) if [ "$UPDATE" -eq 1 ] && [ -f "$DATA_DIR/installed-scheduler.sha256" ] \
-        && [ "$CUR_SCHED_SHA" = "$(cat "$DATA_DIR/installed-scheduler.sha256")" ]; then
-       SCHED_ACTION=replace   # an older version installed by us
-     else
-       die "asvz_scheduler.py is a version I don't know (changed by hand?). Not replacing it. Send the inspect.sh output to Claude."
-     fi ;;
-esac
-ok "Bot files checked (scheduler: $SCHED_ACTION)"
 
-# Chrome paths, as the old per-user unit set them (else the bot's defaults)
+# The timer that runs the bot today: a user unit of the bot's owner (what the
+# bot's setup.sh installs), or else a system unit that runs the scheduler.
 USER_HOME="$(getent passwd "$BOT_USER" | cut -d: -f6)"
-OLD_UNIT_DIR="$USER_HOME/.config/systemd/user"
-CHROME_BIN=""; CHROMEDRIVER_BIN=""
-if [ -f "$OLD_UNIT_DIR/asvz-scheduler.service" ]; then
-  CHROME_BIN="$(sed -n 's/^Environment=CHROME_BIN=//p' "$OLD_UNIT_DIR/asvz-scheduler.service" | head -1)"
-  CHROMEDRIVER_BIN="$(sed -n 's/^Environment=CHROMEDRIVER_BIN=//p' "$OLD_UNIT_DIR/asvz-scheduler.service" | head -1)"
-fi
-for base in "$BOT_DIR" "$BOT_DIR/.."; do
-  [ -z "$CHROME_BIN" ] && [ -x "$base/chrome/chrome-linux64/chrome" ] && CHROME_BIN="$(readlink -f "$base/chrome/chrome-linux64/chrome")"
-  [ -z "$CHROMEDRIVER_BIN" ] && [ -x "$base/chrome/chromedriver-linux64/chromedriver" ] && CHROMEDRIVER_BIN="$(readlink -f "$base/chrome/chromedriver-linux64/chromedriver")"
+UNIT_FILE=""; TIMER_UNIT=""; TIMER_SCOPE=""
+for f in "$USER_HOME/.config/systemd/user/"*.timer; do
+  [ -f "$f" ] || continue
+  svc="${f%.timer}.service"
+  if [ -f "$svc" ] && grep -q "$SCHEDULER_SCRIPT" "$svc"; then
+    TIMER_UNIT="$(basename "${f%.timer}")"; TIMER_SCOPE=user; UNIT_FILE="$svc"; break
+  fi
 done
-[ -n "$CHROME_BIN" ] && [ ! -x "$CHROME_BIN" ] && die "Chrome from the old unit not found: $CHROME_BIN"
-ok "Chrome: ${CHROME_BIN:-default (/usr/local/bin/google-chrome)}"
+if [ -z "$TIMER_UNIT" ]; then
+  for f in /etc/systemd/system/*.timer; do
+    [ -f "$f" ] || continue
+    svc="${f%.timer}.service"
+    if [ -f "$svc" ] && grep -q "$SCHEDULER_SCRIPT" "$svc"; then
+      TIMER_UNIT="$(basename "${f%.timer}")"; TIMER_SCOPE=system; UNIT_FILE="$svc"; break
+    fi
+  done
+fi
+[ -n "$TIMER_UNIT" ] || die "Found no systemd timer that runs $SCHEDULER_SCRIPT. Send the inspect.sh output to Claude."
+ok "Bot timer: $TIMER_UNIT.timer ($TIMER_SCOPE unit, $UNIT_FILE)"
+if [ "$TIMER_SCOPE" = user ] && [ ! -e "/var/lib/systemd/linger/$BOT_USER" ]; then
+  warn "Lingering is off for $BOT_USER: the timer (and the page's control of it) only works while $BOT_USER is logged in."
+fi
+
+CHROME_BIN="$(sed -n 's/^Environment=CHROME_BIN=//p' "$UNIT_FILE" | head -1)"
+CHROMEDRIVER_BIN="$(sed -n 's/^Environment=CHROMEDRIVER_BIN=//p' "$UNIT_FILE" | head -1)"
+ok "Chrome for 'add by number': ${CHROME_BIN:-default of asvz_bot.py, /usr/local/bin/google-chrome}"
 
 if [ ! -f "$BOT_DIR/.asvz-bot.json" ]; then
   warn "No ASVZ login saved in $BOT_DIR/.asvz-bot.json — the bot can't enroll without it."
-  warn "After setup run:  bash $APP_DIR/deploy/asvz-login.sh"
+elif [ "$(stat -c %a "$BOT_DIR/.asvz-bot.json")" != 600 ]; then
+  warn "$BOT_DIR/.asvz-bot.json is readable by others (mode $(stat -c %a "$BOT_DIR/.asvz-bot.json")). Not changing it; to fix: chmod 600 $BOT_DIR/.asvz-bot.json"
 fi
 
 # ---------------------------------------------------------------- questions
 if [ -z "$DOMAIN" ]; then
   read -rp "Your domain at Spaceship (e.g. example.com; the page goes to vb.<domain>): " base
-  base="${base#vb.}"; base="${base%%/*}"; base="${base#https://}"
+  base="${base#https://}"; base="${base%%/*}"; base="${base#vb.}"
   [[ "$base" =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || die "That doesn't look like a domain: $base"
   DOMAIN="vb.$base"
 fi
@@ -136,10 +144,9 @@ if [ "$UPDATE" -eq 0 ]; then
     die "Port $PORT is taken. Pass --port with a free one."
   fi
   echo
-  echo "  Bot folder : $BOT_DIR (runs as $BOT_USER)"
-  echo "  Scheduler  : $( [ $SCHED_ACTION = replace ] && echo 'replace with the desktop version (old one backed up)' || echo 'already the desktop version')"
-  echo "  Page       : https://$DOMAIN  ->  127.0.0.1:$PORT"
-  echo "  Old timer  : $( [ -f "$OLD_UNIT_DIR/asvz-scheduler.timer" ] && echo "$BOT_USER's asvz-scheduler.timer gets turned off (files kept)" || echo 'none found')"
+  echo "  Bot folder : $BOT_DIR — nothing in it is changed"
+  echo "  Bot timer  : $TIMER_UNIT.timer — stays; the page can start it / turn it on or off"
+  echo "  Page       : https://$DOMAIN  ->  127.0.0.1:$PORT (vb-web, runs as $BOT_USER)"
   echo
   read -rp "Go ahead? Type yes: " answer
   [ "$answer" = "yes" ] || die "Stopped, nothing changed."
@@ -149,30 +156,13 @@ fi
 mkdir -p "$BACKUP_ROOT" && chmod 700 "$BACKUP_ROOT"
 BK="$BACKUP_ROOT/bot-$TS.tar.gz"
 tar -czf "$BK" -C "$BOT_DIR" --exclude='./venv' --exclude='./.venv' --exclude='./chrome' \
-    --exclude='__pycache__' --exclude='./watcher_logs' .
+    --exclude='__pycache__' --exclude='./watcher_logs' --exclude='*.png' .
 chmod 600 "$BK"
-ok "Backup of the bot folder (code + data, incl. login file): $BK"
+ok "Backup of the bot folder (code + job list + login file): $BK"
 
-# ---------------------------------------------------------------- 3. bot files
-install_bot_file() {  # name
-  local src="$APP_DIR/bot/$1" dst="$BOT_DIR/$1"
-  if [ -f "$dst" ] && cmp -s "$src" "$dst"; then return; fi
-  [ -f "$dst" ] && mv "$dst" "$dst.before-vb-$TS"
-  install -m 644 -o "$BOT_USER" -g "$(id -gn "$BOT_USER")" "$src" "$dst"
-  ok "Installed $1$( [ -f "$dst.before-vb-$TS" ] && echo " (old one: $1.before-vb-$TS)")"
-}
-[ "$SCHED_ACTION" = replace ] && install_bot_file asvz_scheduler.py
-install_bot_file asvz_plan.py
-install_bot_file keep_awake.py
+# ---------------------------------------------------------------- 3. vb-web
 mkdir -p "$DATA_DIR"
-sha "$SCHED" > "$DATA_DIR/installed-scheduler.sha256"
-[ -f "$BOT_DIR/.asvz-bot.json" ] && chmod 600 "$BOT_DIR/.asvz-bot.json"
-# Only create missing data files; existing ones are never rewritten here.
-[ -f "$BOT_DIR/asvz_schedule.json" ] || { echo '{"jobs": []}' > "$BOT_DIR/asvz_schedule.json"; chown "$BOT_USER" "$BOT_DIR/asvz_schedule.json"; }
-[ -f "$BOT_DIR/asvz_watchers.json" ] || { echo '{}' > "$BOT_DIR/asvz_watchers.json"; chown "$BOT_USER" "$BOT_DIR/asvz_watchers.json"; }
-
-# ---------------------------------------------------------------- 4/5. units
-chown "$BOT_USER" "$DATA_DIR"; chmod 700 "$DATA_DIR"
+chmod 700 "$DATA_DIR"
 cat > "$CONF" <<EOF
 SAVED_BOT_DIR='$BOT_DIR'
 SAVED_DOMAIN='$DOMAIN'
@@ -180,65 +170,45 @@ SAVED_PORT='$PORT'
 EOF
 
 render() {  # template -> stdout (values passed as env vars, not pasted into code)
-  local chrome_env="" vb_chrome_env="" watcher_env=""
-  if [ -n "$CHROME_BIN" ]; then
-    chrome_env="Environment=CHROME_BIN=$CHROME_BIN"; vb_chrome_env="Environment=VB_CHROME_BIN=$CHROME_BIN"
+  local extra=""
+  [ -n "$CHROME_BIN" ] && extra="Environment=VB_CHROME_BIN=$CHROME_BIN"
+  [ -n "$CHROMEDRIVER_BIN" ] && extra="$extra"$'\n'"Environment=VB_CHROMEDRIVER_BIN=$CHROMEDRIVER_BIN"
+  # A non-root user talks to its own systemd user manager through this.
+  if [ "$TIMER_SCOPE" = user ] && [ "$BOT_USER" != root ]; then
+    extra="$extra"$'\n'"Environment=XDG_RUNTIME_DIR=/run/user/$BOT_UID"
   fi
-  if [ -n "$CHROMEDRIVER_BIN" ]; then
-    chrome_env="$chrome_env"$'\n'"Environment=CHROMEDRIVER_BIN=$CHROMEDRIVER_BIN"
-    vb_chrome_env="$vb_chrome_env"$'\n'"Environment=VB_CHROMEDRIVER_BIN=$CHROMEDRIVER_BIN"
-  fi
-  # Non-root: the scheduler would try "systemd-run --user" for watchers,
-  # which has no user session here; KillMode=process keeps them alive anyway.
-  [ "$BOT_USER" != root ] && watcher_env="UnsetEnvironment=INVOCATION_ID"
   R_BOT_USER="$BOT_USER" R_BOT_DIR="$BOT_DIR" R_BOT_PYTHON="$BOT_PYTHON" R_APP_DIR="$APP_DIR" \
-  R_DATA_DIR="$DATA_DIR" R_PORT="$PORT" R_DOMAIN="$DOMAIN" R_CHROME_ENV="$chrome_env" \
-  R_VB_CHROME_ENV="$vb_chrome_env" R_WATCHER_ENV="$watcher_env" python3 -c '
+  R_DATA_DIR="$DATA_DIR" R_PORT="$PORT" R_DOMAIN="$DOMAIN" R_SCHEDULER_SCRIPT="$SCHEDULER_SCRIPT" \
+  R_TIMER_UNIT="$TIMER_UNIT" R_TIMER_SCOPE="$TIMER_SCOPE" R_EXTRA_ENV="$extra" python3 -c '
 import os, re, sys
 s = open(sys.argv[1]).read()
 s = re.sub(r"@([A-Z_]+)@", lambda m: os.environ["R_" + m.group(1)], s)
 sys.stdout.write(re.sub(r"\n{3,}", "\n\n", s))' "$1"
 }
 
-put() {  # content-file target  -> 0 if changed
+put() {  # new-file target  -> 0 if changed (old one backed up)
   if [ -f "$2" ] && cmp -s "$1" "$2"; then rm -f "$1"; return 1; fi
   [ -f "$2" ] && cp -p "$2" "$BACKUP_ROOT/$(basename "$2").$TS"
   mv "$1" "$2"; chmod 644 "$2"; return 0
 }
 
-tmp="$(mktemp)"; render "$APP_DIR/deploy/vb-scheduler.service.in" > "$tmp"; put "$tmp" /etc/systemd/system/vb-scheduler.service || true
-tmp="$(mktemp)"; cp "$APP_DIR/deploy/vb-scheduler.timer" "$tmp"; put "$tmp" /etc/systemd/system/vb-scheduler.timer || true
 tmp="$(mktemp)"; render "$APP_DIR/deploy/vb-web.service.in" > "$tmp"; put "$tmp" /etc/systemd/system/vb-web.service || true
-systemd-analyze verify /etc/systemd/system/vb-scheduler.service /etc/systemd/system/vb-web.service 2>&1 \
-  | grep -v -E 'Unknown key name|^$' || true
 systemctl daemon-reload
 
-if [ "$BOT_USER" != root ]; then
+if [ "$TIMER_SCOPE" = system ] && [ "$BOT_USER" != root ]; then
   SUDO_TMP="$(mktemp)"
   cat > "$SUDO_TMP" <<EOF
-# Installed by vb deploy/setup.sh: lets the phone page start/stop only these units.
-$BOT_USER ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block vb-scheduler.service, /usr/bin/systemctl enable --now vb-scheduler.timer, /usr/bin/systemctl disable --now vb-scheduler.timer
+# Installed by vb deploy/setup.sh: lets the phone page start / switch the bot's timer, nothing else.
+$BOT_USER ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block $TIMER_UNIT.service, /usr/bin/systemctl enable --now $TIMER_UNIT.timer, /usr/bin/systemctl disable --now $TIMER_UNIT.timer
 EOF
   visudo -cf "$SUDO_TMP" >/dev/null || die "sudoers check failed"
   install -m 440 "$SUDO_TMP" /etc/sudoers.d/vb-web; rm -f "$SUDO_TMP"
-  usermod -aG systemd-journal "$BOT_USER"
-  ok "sudo rule /etc/sudoers.d/vb-web (only the vb-scheduler start/stop commands)"
+  ok "sudo rule /etc/sudoers.d/vb-web (only start/enable/disable of $TIMER_UNIT)"
+fi
+if [ "$BOT_USER" != root ]; then
+  usermod -aG systemd-journal "$BOT_USER"   # read the bot's log for the Activity page
 fi
 
-# New timer on first, then the old one off (one scheduler run at a time is
-# guaranteed by the scheduler's own lock file anyway).
-systemctl enable --now vb-scheduler.timer >/dev/null
-ok "vb-scheduler.timer on: $(systemctl show vb-scheduler.timer -p NextElapseUSecRealtime --value)"
-if [ -f "$OLD_UNIT_DIR/asvz-scheduler.timer" ]; then
-  if systemctl --user -M "$BOT_USER@" disable --now asvz-scheduler.timer >/dev/null 2>&1; then
-    ok "Old per-user asvz-scheduler.timer turned off (unit files kept in $OLD_UNIT_DIR)"
-  else
-    warn "Couldn't turn off $BOT_USER's asvz-scheduler.timer automatically. Both timers running is safe (lock file), but turn the old one off later:"
-    warn "  systemctl --user -M $BOT_USER@ disable --now asvz-scheduler.timer"
-  fi
-fi
-
-# ---------------------------------------------------------------- page login
 if ! python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["hash"]' "$DATA_DIR/auth.json" 2>/dev/null; then
   info "Choose the login for the phone page (not your university login):"
   VB_DATA_DIR="$DATA_DIR" python3 "$APP_DIR/web/server.py" set-password
@@ -254,7 +224,7 @@ done
 curl -fsS "http://127.0.0.1:$PORT/api/me" >/dev/null || die "vb-web did not start. See: journalctl -u vb-web -n 50 --no-pager"
 ok "vb-web running on 127.0.0.1:$PORT"
 
-# ---------------------------------------------------------------- Caddy
+# ---------------------------------------------------------------- 4. Caddy
 CADDYFILE=/etc/caddy/Caddyfile
 [ -f "$CADDYFILE" ] || die "$CADDYFILE not found"
 tmp="$(mktemp)"; render "$APP_DIR/deploy/vb.caddy.in" > "$tmp"
@@ -294,4 +264,4 @@ else
 fi
 echo
 echo "  Open https://$DOMAIN on your phone, log in, then browser menu -> 'Add to Home screen'."
-echo "  Logs: journalctl -u vb-web -n 50 --no-pager    journalctl -u vb-scheduler -n 50 --no-pager"
+echo "  Logs: journalctl -u vb-web -n 50 --no-pager"

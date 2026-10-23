@@ -266,19 +266,26 @@ async function refreshStatus() {
     state.serverOffset = new Date(s.server_time) - Date.now();
     $("#banner").hidden = s.timer;
     $("#act-timer").checked = s.timer;
+    $("#act-timer-sub").textContent = `Your bot's timer (${s.timer_unit}): processes due sign-ups, phone or no phone`;
     const c = s.credentials;
     $("#act-login").textContent = c.set
       ? `${c.username} · ${c.organisation} · stored on the server only`
       : "Not set up on the server yet — see README (“ASVZ login”).";
     const next = s.timer_next && s.timer && !s.timer_next.startsWith("n/a") ? ` · next check ${s.timer_next}` : "";
     const t = new Date(s.server_time);
-    $("#act-server").textContent = (s.running ? "Checking now" : "Idle") + next +
+    $("#act-server").textContent = (s.running ? "The bot is running a check now" : "Idle") + next +
+      (s.pending ? ` · ${plural(s.pending, "change")} waiting` : "") +
+      (s.scheduler_ok ? "" : " · ERROR: scheduler script not found") +
       ` · server clock ${t.toLocaleTimeString("en-GB", { timeZone: ZURICH, hour: "2-digit", minute: "2-digit" })} Zurich time` +
-      (s.plan_error ? ` · ERROR: ${s.plan_error}` : "");
+      "";
   } catch (e) { if (e.status !== 401) $("#act-server").textContent = e.message; }
 }
 
 async function setTimer(on) {
+  if (!on && !await confirmDialog("Turn off background checks?",
+      "Your bot then signs up for nothing until you turn them on again — also not from the text menu's queue.", "Turn off")) {
+    refreshStatus(); return;
+  }
   try {
     const r = await api("timer", { on });
     toast(r.message);
@@ -498,6 +505,7 @@ async function signUp() {
   const weekly = $("#sel-weekly").checked, watch = $("#sel-watch").checked;
   try {
     const r = await api("signup", { sport: state.sport.id, keys, weekly, watch });
+    if (r.pending) { toast(r.message, 7000); state.selected.clear(); updateSelection(); syncChecks(); return; }
     toast(`Signed up for ${plural(r.offers, "offer")} (${weekly ? "every week" : "the next date"}) · ` +
           `${plural(r.queued, "date")} queued`);
     r.messages.forEach((m, i) => setTimeout(() => toast(m, 6000), 600 * (i + 1)));
@@ -558,7 +566,7 @@ function renderPlan() {
   ics.innerHTML = ICONS.cal;
   ics.append("Calendar file…");
   const sync = iconButton("refresh", "Look for newly published dates now", (ev) => busy(ev.currentTarget, async () => {
-    try { const r = await api("plan/sync", {}); toast(r.queued ? `${plural(r.queued, "new date")} queued` : "Up to date — no new dates yet"); }
+    try { const r = await api("plan/sync", {}); toast(r.message); }
     catch (e) { toast(e.message); }
     refreshPlan();
   }));
@@ -573,7 +581,7 @@ function renderPlan() {
     sw.addEventListener("change", async () => {
       try {
         const r = await api("plan/weekly", { key: e.key, weekly: sw.checked });
-        if (r.message) toast(r.message); else if (r.queued) toast(`${plural(r.queued, "new date")} queued`);
+        if (r.message) toast(r.message, r.pending ? 7000 : 4000);
       } catch (err) { toast(err.message); sw.checked = !sw.checked; }
       refreshPlan();
     });
@@ -587,15 +595,23 @@ function renderPlan() {
           if (!await confirmDialog("Remove from plan?", `${e.sport_name}: ${e.title} (${WEEKDAYS[e.weekday]} ${e.start}).\n` +
             "Queued dates of this offer are removed too.", "Remove")) return;
           try { const r = await api("plan/remove", { key: e.key });
-                toast(`Removed ${e.title}` + (r.removed_jobs ? ` and ${plural(r.removed_jobs, "queued date")}` : "")); }
+                toast(r.pending ? r.message : `${e.title}: ${r.message}`, r.pending ? 7000 : 4000); }
           catch (err) { toast(err.message); }
           await refreshPlan(); rebuildOffers();
         }))));
   }
   body.append(g);
 
+  // -- changes waiting for a run to finish
+  if (p.pending.length) {
+    [g, list] = group("Waiting for the bot", "The bot is in the middle of a run; these are applied right after it.");
+    for (const label of p.pending) list.append(el("div", { class: "row" }, el("div", { class: "row-title" }, label)));
+    body.append(g);
+  }
+
   // -- upcoming sign-ups
-  [g, list] = group("Upcoming sign-ups", "The bot enrolls you the moment enrollment opens (usually 24 h before).");
+  [g, list] = group("Upcoming sign-ups", "The bot enrolls you the moment enrollment opens (usually 24 h before). " +
+    `Weekly offers are queued about ${p.queue_days} days ahead.`);
   if (!p.jobs.length) list.append(el("div", { class: "row" }, el("div", { class: "row-title" }, "No sign-ups queued")));
   for (const j of p.jobs) {
     const opens = j.enrollment_start;
@@ -609,7 +625,7 @@ function renderPlan() {
     link.innerHTML = ICONS.web;
     suffix.append(link, iconButton("skip", "Skip this date", async () => {
       if (!await confirmDialog("Skip this date?", `${j.title || "Lesson " + j.lesson_id}\n${shortDate(j.lesson_start)}`, "Skip")) return;
-      try { await api("jobs/remove", { id: j.id }); toast("Date skipped"); } catch (e) { toast(e.message); }
+      try { const r = await api("jobs/remove", { id: j.id }); toast(r.message, r.pending ? 7000 : 4000); } catch (e) { toast(e.message); }
       refreshPlan();
     }));
     list.append(el("div", { class: "row" },
