@@ -112,7 +112,6 @@ function ago(ms) {
 }
 function clock(ms) { return new Date(ms).toLocaleTimeString("en-GB", { timeZone: ZURICH, hour: "2-digit", minute: "2-digit", second: "2-digit" }); }
 const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
-function zurichWeekday() { return WD_SHORT.indexOf(parts(now()).weekday); }
 
 function sportColor(name) {
   let h = 0;
@@ -655,9 +654,10 @@ async function loadOffers(force = false) {
   try {
     const r = await api(`offers?sport=${encodeURIComponent(sport.id)}${force ? "&force=1" : ""}`);
     if (gen !== offersGen) return;
-    const today = zurichWeekday();
-    state.offers = r.offers.sort((a, b) => ((a.weekday - today + 7) % 7) - ((b.weekday - today + 7) % 7)
-      || a.start.localeCompare(b.start) || a.sport_name.localeCompare(b.sport_name) || a.title.localeCompare(b.title));
+    // By the next time each course actually takes place: a course that was
+    // earlier today comes last (next week), not first. Past-only ones are dropped.
+    state.offers = r.offers.filter((o) => o.upcoming).sort((a, b) => a.upcoming.localeCompare(b.upcoming)
+      || a.sport_name.localeCompare(b.sport_name) || a.title.localeCompare(b.title));
     fillSelect("#f-place", "All locations", state.offers.map((o) => o.location));
     fillSelect("#f-level", "All levels", state.offers.map((o) => o.niveau));
     fillSelect("#f-sport", "All sports", state.offers.map((o) => o.sport_name));
@@ -721,7 +721,8 @@ function applyFilters() {
       && (!level || o.niveau === level) && (!sport || o.sport_name === sport)
       && (!q || `${o.title} ${o.sport_name} ${o.instructor}`.toLowerCase().includes(q));
     if (!ok) continue;
-    if (o.weekday !== lastDay) { frag.append(el("div", { class: "weekday-header" }, WEEKDAYS[o.weekday])); box = el("div", { class: "list" }); frag.append(box); lastDay = o.weekday; }
+    const day = dayKey(o.upcoming);
+    if (day !== lastDay) { frag.append(el("div", { class: "weekday-header" }, dateHeading(o.upcoming))); box = el("div", { class: "list" }); frag.append(box); lastDay = day; }
     box.append(r); shown++;
   }
   list.replaceChildren(frag);
@@ -730,6 +731,15 @@ function applyFilters() {
     state.sport.id === "starred" ? "Tap ★ next to a course to keep it here." : "ASVZ has no upcoming lessons for this right now.");
   else if (!shown) statusPage(st, "empty", "No matching courses", "Try fewer filters.");
   else st.replaceChildren();
+}
+
+// "Today", "Tomorrow" or "Saturday 31.10."
+function dateHeading(iso) {
+  const d = dayKey(iso), t = dayKey(now()), tm = dayKey(new Date(now().getTime() + 86400000));
+  const p = parts(iso);
+  if (d === t) return "Today";
+  if (d === tm) return "Tomorrow";
+  return `${WEEKDAYS[WD_SHORT.indexOf(p.weekday)]} ${p.day}.${p.month}.`;
 }
 
 function syncChecks() { for (const r of rows) r.check.checked = state.selected.has(r.offer.key); }

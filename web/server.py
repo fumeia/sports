@@ -380,24 +380,13 @@ def week_result(starred=True):
                            starred_lessons() if starred else [], plan.offer_key, pid_alive)
 
 
-def radar_lessons():
-    """Fresh free-place counts of the starred courses (one ASVZ request per sport)."""
-    favs = week.FAVS.load()["offers"]
-    out = []
-    for sport_id in {m.get("sport_id") for m in favs.values() if m.get("sport_id")}:
-        for o in get_offers(sport_id, force=True):
-            if o["key"] in favs:
-                out += o["lessons"]
-    return out
-
-
 def monitor_loop():
     """Results + notifications from the bot's log (see week.py)."""
     while True:
         try:
             week.monitor_once(lambda: helper("read"), lambda: helper("log", "400"),
                               runs_from_journal, timer_status, PUBLIC_URL,
-                              week_fn=week_result, radar_fn=radar_lessons)
+                              week_fn=week_result)
         except Exception:
             log.exception("Monitor")
         time.sleep(MONITOR_SECONDS)
@@ -570,6 +559,8 @@ def get_offers(sport, force=False):
 
 def offer_json(o):
     nxt = next(iter(_bookable(o["lessons"])), None)
+    now = datetime.now().astimezone()
+    upcoming = next((l for l in o["lessons"] if l["start"] > now and not l["cancelled"]), None)
     return {
         "key": o["key"], "sport_id": o["sport_id"], "sport_name": o["sport_name"],
         "title": o["title"], "weekday": o["weekday"], "start": o["start"], "end": o["end"],
@@ -577,6 +568,8 @@ def offer_json(o):
         "partial": bool(o.get("partial")),
         "next": {"start": nxt["start"].isoformat(), "free": nxt["free"], "max": nxt["max"]}
         if nxt else None,
+        # the next time it actually takes place (for sorting/grouping by date)
+        "upcoming": upcoming["start"].isoformat() if upcoming else None,
     }
 
 
@@ -1194,7 +1187,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return {"enabled": n["enabled"], "server": n["server"], "topic": n["topic"],
                 "events": n["events"],
                 "labels": {**{k: v[0] for k, v in week.EVENT_TEXT.items()},
-                           "radar": "Free-spot radar: a spot opens in a starred course you're not signed up for",
                            "summary": f"Sunday summary at {week.SUMMARY_HOUR}:00: your sign-ups for the week ahead"}}
 
     def api_post_notify(self, b):

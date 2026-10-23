@@ -10,7 +10,7 @@ successfully" into a per-lesson result (history.json), and sends a phone
 notification (ntfy) for each new one.
 
 Also here: pausing a week, the overlap check, the Sunday summary, the
-free-spot radar for starred courses and the calendar feed.
+calendar feed.
 
 Everything here lives in the data dir; nothing touches the bot folder.
 """
@@ -224,11 +224,9 @@ EVENT_TEXT = {  # type -> (title, tags, priority)
     "error": ("Bot error", "rotating_light", 4),
     "health_bad": ("The bot isn't running", "rotating_light", 5),
     "health_ok": ("The bot runs again", "white_check_mark", 3),
-    "radar": ("A spot is free in a starred course", "bell", 4),
     "summary": ("Your week ahead", "calendar", 3),
 }
 SUMMARY_HOUR = 19          # Sunday, Zurich time
-RADAR_SECONDS = int(os.environ.get("VB_RADAR_SECONDS", "300"))  # how often starred courses are checked for freed spots
 DEFAULT_EVENTS = {k: True for k in EVENT_TEXT}
 
 
@@ -270,7 +268,7 @@ def notify_event(ev, public_url=None):
     if not n["enabled"] or not n["events"].get(ev["type"], True):
         return
     title, tags, prio = EVENT_TEXT[ev["type"]]
-    if ev.get("message"):  # events that bring their own text (radar, summary)
+    if ev.get("message"):  # events that bring their own text (summary)
         send(title, ev["message"], tags, prio, click=public_url)
         return
     h = HISTORY.load()["lessons"].get(ev.get("lesson_id") or "", {})
@@ -300,9 +298,9 @@ def remember_jobs(jobs):
 
 
 def monitor_once(read, read_log, runs_from_journal, timer_status, public_url=None,
-                 week_fn=None, radar_fn=None):
+                 week_fn=None):
     """read(): {"jobs", "watchers"}; read_log(): {"journal", "watchers"};
-    week_fn(): build_week() result; radar_fn(): fresh lessons of starred courses."""
+    week_fn(): build_week() result."""
     data = read()
     remember_jobs(data["jobs"])
     state = MONITOR.load()
@@ -348,12 +346,8 @@ def monitor_once(read, read_log, runs_from_journal, timer_status, public_url=Non
         ev = sunday_summary(state, week_fn)
         if ev:
             new_events.append(ev)
-    if radar_fn and time.time() - state.get("radar_at", 0) >= RADAR_SECONDS:
-        state["radar_at"] = time.time()
-        try:
-            new_events += radar(state, radar_fn(), week_fn()["items"] if week_fn else [], first)
-        except Exception as e:
-            log.warning(f"Radar: {e}")
+    for k in ("radar", "radar_at"):  # state of the removed free-spot radar
+        state.pop(k, None)
     state.setdefault("last_run", 0)   # marks the quiet first pass as done
     with MONITOR.lock:   # merge: remember_jobs() may have added jobs meanwhile
         merged = {**jobs_seen, **MONITOR.load().get("jobs_seen", {})}
@@ -522,32 +516,6 @@ def sunday_summary(state, week_fn):
     state["summary_sent"] = today
     return {"type": "summary", "t": int(time.time() * 1000), "message": summary_text(week_fn())}
 
-
-# ----------------------------------------------------------------------
-# free-spot radar for starred courses you're not signed up for
-# ----------------------------------------------------------------------
-
-def radar(state, lessons, items, quiet):
-    """Notifies when a date of a starred course goes from full to free
-    while its enrollment is open. Remembers the last free count per date."""
-    now = datetime.now(timezone.utc)
-    mine = {i["lesson_id"] for i in items if i["kind"] in ACTIVE}
-    seen = state.setdefault("radar", {})
-    events, keep = [], {}
-    for l in lessons:
-        lid = str(l["id"])
-        free = l.get("free")
-        is_open = (l["oe_enabled"] and not l["cancelled"] and (l["oe_from"] or now) <= now
-                   < (l["oe_to"] or l["start"]))
-        if free is None or not is_open or lid in mine:
-            continue
-        keep[lid] = free
-        if not quiet and seen.get(lid) is not None and seen[lid] <= 0 < free:
-            events.append({"type": "radar", "lesson_id": lid, "t": int(time.time() * 1000),
-                           "message": f"{l['sport_name']}: {l['title']} · {short(l['start'])} · "
-                                      f"{l['location']} · {free} free now - tap to sign up"})
-    state["radar"] = keep
-    return events
 
 
 # ----------------------------------------------------------------------

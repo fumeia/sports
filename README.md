@@ -31,10 +31,6 @@ phone only sends commands and shows status.
   subscribed calendars only every few hours.
 - **Sunday summary**: Sunday at 19:00, one notification with next week's
   sign-ups (or "paused").
-- **Free-spot radar**: every 5 minutes the starred courses you're *not*
-  signed up for are checked at ASVZ. When a full date gets a free place
-  while enrollment is open, you get a notification and can sign up in the
-  app.
 - **Phone notifications** via the free ntfy app: signed up, full → watching,
   a freed-up spot taken, missed, failed attempt, and "the bot isn't running".
   The topic is a long random name and works like a password. Messages contain
