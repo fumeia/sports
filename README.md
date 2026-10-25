@@ -10,8 +10,9 @@ phone only sends commands and shows status.
   - Your week as a timeline: queued / signing up now / signed up ✓ (with place
     number) / full, waiting for a spot / missed / failed, plus starred courses
     you're not signed up for, shown faded. Tap one to sign up, skip, switch
-    every week on or off, star or unstar it.
-  - Below the timeline: your courses.
+    every week or "wait if full" on or off, star or unstar it.
+  - Below the timeline: your courses, each with *Weekly* and *Wait if full*
+    switches (*Wait if full* changes the dates already queued too).
 - **Find**: ASVZ's lesson search (the desktop app's Discover), with ★ for
   sports and courses. Starred sports come first, and "Starred courses" lists
   all starred courses across sports.
@@ -113,6 +114,8 @@ before; nothing new there.)
 | `deploy/update.sh` | `git pull` + re-apply. |
 | `deploy/rollback.sh` | Remove vb again (stop the page; tells you which Caddy line to remove). |
 | `deploy/disable-unused.sh` | Turn off the unused torrent/media tools (`--undo` turns them back on). |
+| `deploy/close-ports.sh` | Obsidian/Immich only through Caddy (ports on 127.0.0.1), printer service off; `--undo`. |
+| `deploy/inspect-ports.sh` | Read-only: what's reachable from the internet. |
 | `deploy/compare-scheduler.sh` | Read-only: the server scheduler vs. the release version. |
 | `deploy/asvz-login.sh` | Only if the bot has no saved login: writes `.asvz-bot.json`. |
 | `tests/` | Fake bot, stand-in scheduler and fake ASVZ data, to try the page without a server. |
@@ -200,3 +203,7 @@ Open http://127.0.0.1:8710, log in as `test` / `test-password-123`. It uses
 made-up lessons, a stub `asvz_bot.py` that only writes `enrolled.log`, and a
 stand-in scheduler with the same file handling as the server's
 (`VB_TEST_SCHEDULER=/path/to/asvz_scheduler.py` uses a real one instead).
+
+## Also in this repo
+
+- `livesync/`: a shared Obsidian vault for you and collaborators (Self-hosted LiveSync on your server). See `livesync/README.md`.

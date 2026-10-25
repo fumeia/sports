@@ -283,6 +283,10 @@ def _after_change(before, started):
         EXPECT[lid] = {"until": until, "present": True, "job": a[lid]}
     for lid in b.keys() - a.keys():
         EXPECT[lid] = {"until": until, "present": False, "job": b[lid]}
+    for lid in a.keys() & b.keys():
+        w = bool(a[lid].get("watch_free_slot"))
+        if w != bool(b[lid].get("watch_free_slot")):
+            EXPECT[lid] = {"until": until, "present": True, "job": a[lid], "watch": w}
     if any(t < started for _, t in scheduler_runs()):
         log.warning("A scheduler run started while we changed the job list — will re-check after it.")
 
@@ -331,6 +335,10 @@ def repair():
                     e["job"] = job
                     changed = True
                     log.warning(f"Re-added lesson {lid}: a scheduler run had overwritten it.")
+            elif e["present"] and "watch" in e and bool(have[lid].get("watch_free_slot")) != e["watch"]:
+                have[lid]["watch_free_slot"] = e["watch"]
+                changed = True
+                log.warning(f"Set wait-if-full for lesson {lid} again: a scheduler run had undone it.")
             elif not e["present"] and lid in have:
                 jobs = [j for j in jobs if str(j.get("lesson_id")) != lid]
                 changed = True
@@ -988,6 +996,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if applied and n:
             kick_scheduler()
         return self._changed(applied, f"{n} new date(s) queued" if n else "")
+
+    def api_post_plan_watch(self, b):
+        """"If full, wait for a spot" for a whole course: its queued dates
+        now, and the dates queued later (asvz_plan copies entry["watch"])."""
+        key, watch = str(b.get("key", "")), bool(b.get("watch"))
+
+        def go():
+            with plan.schedule_lock():
+                p = plan.load_plan()
+                e = next((e for e in p["entries"] if e["key"] == key), None)
+                if not e:
+                    raise ApiError(404, "Course not in your plan")
+                e["watch"] = watch
+                plan.save_plan(p)
+                jobs, n = plan.load_schedule(), 0
+                for j in jobs:
+                    if j.get("offer_key") == key and bool(j.get("watch_free_slot")) != watch:
+                        j["watch_free_slot"] = watch
+                        n += 1
+                if n:
+                    plan.save_schedule(jobs)
+                return n
+        applied, n = change("Wait if full " + ("on" if watch else "off"), go)
+        return self._changed(applied, ("Waits for a spot if full" if watch else "Won't wait if full")
+                             + (f" · {n} queued date{'s' if n != 1 else ''} updated" if n else ""))
+
+    def api_post_jobs_watch(self, b):
+        """The same for one queued date (also lessons added in the text menu)."""
+        try:
+            job_id = int(b.get("id"))
+        except (TypeError, ValueError):
+            raise ApiError(400, "Bad job id")
+        watch = bool(b.get("watch"))
+
+        def go():
+            with plan.schedule_lock():
+                jobs = plan.load_schedule()
+                job = next((j for j in jobs if j["id"] == job_id), None)
+                if not job:
+                    raise ApiError(404, "That date isn't queued anymore")
+                job["watch_free_slot"] = watch
+                plan.save_schedule(jobs)
+        applied, _ = change("Wait if full " + ("on" if watch else "off") + " (one date)", go)
+        return self._changed(applied, "Waits for a spot if full" if watch else "Won't wait if full")
 
     def api_post_plan_skip(self, b):
         """Skip one future date of a weekly course before it's queued."""

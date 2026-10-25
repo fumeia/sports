@@ -178,6 +178,18 @@ function showOverlaps(r, delay = 900) {
   (r.overlaps || []).forEach((m, i) => setTimeout(() => toast("⚠ " + m, 8000), delay * (i + 1)));
 }
 
+// A switch that saves itself; on failure it flips back.
+function watchSwitch(checked, label, save) {
+  const sw = el("input", { type: "checkbox", class: "switch", "aria-label": label });
+  sw.checked = checked;
+  sw.addEventListener("change", async () => {
+    try { const r = await save(sw.checked); if (r.message) toast(r.message, r.pending ? 7000 : 3000); }
+    catch (e) { toast(e.message); sw.checked = !sw.checked; }
+    loadWeek();
+  });
+  return sw;
+}
+
 async function setFav(kind, id, on, extra = {}) {
   state.favs = await api("favs", { kind, id, on, ...extra });
   toast(on ? "Starred" : "Star removed", 1800);
@@ -458,12 +470,12 @@ function openSheet(it) {
   if (it.kind === "starred") status = it.bookable === false ? "Starred · enrollment is closed for this date"
     : `Starred · not signed up${it.enroll_start ? ` · enrollment opens ${shortDate(it.enroll_start)}` : ""}`;
   const actions = el("div", { class: "actions" });
-  body.replaceChildren(el("div", { class: "grab" }),
+  body.replaceChildren(...[el("div", { class: "grab" }),
     el("h3", {}, it.title || `Lesson ${it.lesson_id}`),
     el("div", { class: "meta" }, [`${shortDate(it.start)}–${hm(it.end)}`, it.location, it.niveau].filter(Boolean).join(" · ")),
     it.instructor ? el("div", { class: "meta" }, `Trainer: ${it.instructor}`) : null,
     el("div", { class: "stline" }, icon(ic, "st " + cls), el("div", {}, status)),
-    it.overlaps ? el("div", { class: "paused-note" }, `⚠ Overlaps with ${it.overlaps.join(", ")}`) : null, actions);
+    it.overlaps ? el("div", { class: "paused-note" }, `⚠ Overlaps with ${it.overlaps.join(", ")}`) : null, actions].filter(Boolean));
   const after = async () => { closeSheet(); await loadWeek(); };
 
   if (it.kind === "starred" && it.bookable !== false) {
@@ -481,6 +493,8 @@ function openSheet(it) {
       }) }, "Sign up every week"));
   }
   if (it.kind === "planned") {
+    actions.append(el("label", { class: "opt" }, "If full, wait for a spot (whole course)",
+      watchSwitch(!!it.watch, "If full, wait for a spot", (on) => api("plan/watch", { key: it.offer_key, watch: on }))));
     actions.append(el("button", { class: "btn danger wide", onclick: (ev) => busy(ev.currentTarget, async () => {
       if (!await confirmDialog("Skip this date?", `${it.title}\n${shortDate(it.start)}\nThe other weeks stay.`, "Skip")) return;
       try { const r = await api("plan/skip", { key: it.offer_key, lesson_id: it.lesson_id }); toast(r.message, r.pending ? 7000 : 3000); await after(); }
@@ -498,6 +512,8 @@ function openSheet(it) {
       });
       actions.append(el("label", { class: "opt" }, "Every week", sw));
     }
+    actions.append(el("label", { class: "opt" }, "If full, wait for a spot (this date)",
+      watchSwitch(!!it.watch, "If full, wait for a spot", (on) => api("jobs/watch", { id: it.job_id, watch: on }))));
     actions.append(el("button", { class: "btn danger wide", onclick: (ev) => busy(ev.currentTarget, async () => {
       if (!await confirmDialog("Skip this date?", `${it.title || "Lesson " + it.lesson_id}\n${shortDate(it.start)}`, "Skip")) return;
       try { const r = await api("jobs/remove", { id: it.job_id }); toast(r.message, r.pending ? 7000 : 3000); await after(); }
@@ -539,12 +555,15 @@ async function renderCourses() {
       catch (err) { toast(err.message); sw.checked = !sw.checked; }
       loadWeek();
     });
+    const wsw = watchSwitch(!!e.watch, "If full, wait for a spot",
+      (on) => api("plan/watch", { key: e.key, watch: on }));
     list.append(el("div", { class: "row offer", color: sportColor(e.sport_name) },
       el("div", { class: "row-text" }, el("div", { class: "row-title" }, `${e.sport_name}: ${e.title}`),
-        el("div", { class: "row-sub" }, `${WEEKDAYS[e.weekday]}s ${e.start}–${e.end} · ${e.location}` + (e.watch ? " · waits if full" : ""))),
+        el("div", { class: "row-sub" }, `${WEEKDAYS[e.weekday]}s ${e.start}–${e.end} · ${e.location}`)),
       el("div", { class: "row-end" },
         starButton(!!state.favs.offers[e.key], "Star", (on) => setFav("offer", e.key, on, { sport: e.key.split("|")[0] })),
         el("label", { class: "switch-label dim caption" }, "Weekly", sw),
+        el("label", { class: "switch-label dim caption" }, "Wait if full", wsw),
         el("button", { class: "btn ghost icon", "aria-label": "Remove", title: "Remove from your courses", html: ICON.trash,
           onclick: async () => {
             if (!await confirmDialog("Remove this course?", `${e.sport_name}: ${e.title} (${WEEKDAYS[e.weekday]} ${e.start}).\nIts queued dates are removed too.`, "Remove")) return;
