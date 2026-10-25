@@ -10,8 +10,9 @@ phone only sends commands and shows status.
   - Your week as a timeline: queued / signing up now / signed up ✓ (with place
     number) / full, waiting for a spot / missed / failed, plus starred courses
     you're not signed up for, shown faded. Tap one to sign up, skip, switch
-    every week on or off, star or unstar it.
-  - Below the timeline: your courses.
+    every week or "wait if full" on or off, star or unstar it.
+  - Below the timeline: your courses, each with *Weekly* and *Wait if full*
+    switches (*Wait if full* changes the dates already queued too).
 - **Find**: ASVZ's lesson search (the desktop app's Discover), with ★ for
   sports and courses. Starred sports come first, and "Starred courses" lists
   all starred courses across sports.
