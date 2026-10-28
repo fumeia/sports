@@ -65,13 +65,16 @@ class Store:
 
 
 def setup(data_dir):
-    global FAVS, HISTORY, NOTIFY, MONITOR, PAUSES, CALENDAR
+    global FAVS, HISTORY, NOTIFY, MONITOR, PAUSES, CALENDAR, WATCH_AFTER
     FAVS = Store(os.path.join(data_dir, "favorites.json"), {"sports": {}, "offers": {}})
     HISTORY = Store(os.path.join(data_dir, "history.json"), {"lessons": {}})
     NOTIFY = Store(os.path.join(data_dir, "notify.json"), {})
     MONITOR = Store(os.path.join(data_dir, "monitor.json"), {})
     PAUSES = Store(os.path.join(data_dir, "pauses.json"), {"weeks": {}})
     CALENDAR = Store(os.path.join(data_dir, "calendar.json"), {})
+    # "If full, wait for a spot" dates that first race the opening as a
+    # normal sign-up; lesson id -> {"job", "seen"} (see server.py)
+    WATCH_AFTER = Store(os.path.join(data_dir, "watch_after.json"), {"lessons": {}})
 
 
 # ----------------------------------------------------------------------
@@ -132,12 +135,16 @@ RX = {
     "missed": re.compile(r"Job #(\d+) missed the window"),
     "watch": re.compile(r"Handing job #(\d+) off to a detached watcher"),
     "spawnfail": re.compile(r"Failed to spawn watcher for job\s*#(\d+)"),
+    # the bot's enroll() logs these and returns normally either way, so the
+    # scheduler says "finished successfully" also when the lesson was full
+    "nobutton": re.compile(r"Enrollment failed: no active button"),
+    "success": re.compile(r"Enrollment SUCCESS|Successfully enrolled|Enrollment detected"),
 }
 
 
 def events_from_run(run, jobs_seen):
     """[{type, job_id, lesson_id?, place?, error?}] for one scheduler run."""
-    events, cur, lesson_of, place_of = [], None, {}, {}
+    events, cur, lesson_of, place_of, full, ok = [], None, {}, {}, set(), set()
     for line in run["lines"]:
         msg = line["msg"]
         if m := RX["start"].search(msg):
@@ -147,13 +154,20 @@ def events_from_run(run, jobs_seen):
             lesson_of[cur] = m.group(2)
         if (m := RX["place"].search(msg)) and cur:
             place_of[cur] = m.group(1).strip(".,")
+        if cur and RX["nobutton"].search(msg):
+            full.add(cur)
+        if cur and RX["success"].search(msg):
+            ok.add(cur)
         for kind in ("ok", "fail", "missed", "watch", "spawnfail"):
             if m := RX[kind].search(msg):
                 jid = m.group(1)
                 job = jobs_seen.get(jid, {})
+                typ = {"ok": "signed", "fail": "failed", "missed": "missed",
+                       "watch": "watching", "spawnfail": "error"}[kind]
+                if typ == "signed" and jid in full and jid not in ok:
+                    typ = "full"
                 events.append({
-                    "type": {"ok": "signed", "fail": "failed", "missed": "missed",
-                             "watch": "watching", "spawnfail": "error"}[kind],
+                    "type": typ,
                     "job_id": jid, "t": line["t"],
                     "lesson_id": str(lesson_of.get(jid) or job.get("lesson_id") or ""),
                     "place": place_of.get(jid),
@@ -220,6 +234,7 @@ EVENT_TEXT = {  # type -> (title, tags, priority)
     "watching": ("Full - watching for a free spot", "eyes", 3),
     "watch_gave_up": ("No spot freed up", "x", 3),
     "missed": ("Missed a sign-up", "warning", 4),
+    "full": ("Full when enrollment opened", "x", 4),
     "failed": ("Sign-up attempt failed (will retry)", "warning", 3),
     "error": ("Bot error", "rotating_light", 4),
     "health_bad": ("The bot isn't running", "rotating_light", 5),
@@ -414,6 +429,7 @@ def build_week(jobs, watchers, plan_entries, starred_lessons, offer_key, alive,
             "url": kw.get("url") or f"https://schalter.asvz.ch/tn/lessons/{lid}", **kw})
 
     watching = {str(w.get("lesson_id")): (jid, w) for jid, w in watchers.items() if alive(w.get("pid"))}
+    watch_after = WATCH_AFTER.load()["lessons"]
     for j in jobs:
         lid = str(j.get("lesson_id"))
         h = hist.get(lid, {})
@@ -427,7 +443,8 @@ def build_week(jobs, watchers, plan_entries, starred_lessons, offer_key, alive,
             niveau=j.get("niveau"), offer_key=j.get("offer_key"), url=j.get("lesson_url"),
             enroll_start=aware(j.get("enrollment_start")).isoformat()
             if aware(j.get("enrollment_start")) else None,
-            watch=bool(j.get("watch_free_slot")), error=h.get("error"))
+            watch=bool(j.get("watch_free_slot")) or lid in watch_after,
+            watch_after=lid in watch_after, error=h.get("error"))
     for lid, (jid, w) in watching.items():
         if lid in have:
             continue
@@ -439,6 +456,7 @@ def build_week(jobs, watchers, plan_entries, starred_lessons, offer_key, alive,
         if lid in have:
             continue
         kind = {"signed": "signed", "watch_ok": "signed", "missed": "missed", "error": "failed",
+                "full": "missed",
                 "watch_gave_up": "missed", "failed": "failed", "watching": "missed"}.get(h["status"])
         if h["status"] == "watching":  # watcher not alive anymore and no success seen
             kind = "missed" if (aware(h.get("lesson_start")) or now) < now else "watching"
