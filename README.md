@@ -100,6 +100,17 @@ overwritten. So:
 (Using the text menu while the timer runs has the same overwrite risk as
 before; nothing new there.)
 
+### "If full, wait for a spot"
+
+The bot's free-spot watcher starts 17 minutes before enrollment opens and
+only tells "Ausgebucht" from anything else: before the opening it keeps
+trying to click, and once you're signed up the same button means
+"Einschreibung entfernen", so a click signs you out again. So vb gives such
+a date a normal sign-up job for the opening. Only if the bot's log then says
+it was full (or missed) does vb add the watch job, which starts at once.
+Signed up: no watcher. This also applies to watch jobs added in the text
+menu, if their enrollment hasn't opened yet. The scheduler isn't changed.
+
 ## What's in this repo
 
 | Path | What |
