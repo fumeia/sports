@@ -5,15 +5,16 @@
 # (the server sent a photo whose owner + checksum the phone already has
 # under another asset id).
 #
-#   bash /opt/vb/deploy/check-immich.sh [CHECKSUM]
+#   bash /opt/vb/deploy/check-immich.sh [CHECKSUM | ID ...]
 #
 # CHECKSUM: the base64 value from the app's error (e.g. LP8ruMn...=), to
-# look up that photo. Changes nothing: docker ps/logs/inspect, an HTTP GET
+# look up that photo. ID: a photo or album id (uuid) from an error, e.g.
+# "FOREIGN KEY constraint failed ... remote_album_asset_entity". Changes nothing: docker ps/logs/inspect, an HTTP GET
 # for the version, and SELECTs in a read-only database transaction.
 # The database password is never printed.
 set -u
 DIR="${IMMICH_DIR:-/opt/immich}"
-SUM="${1:-}"
+ARGS=("$@")
 h() { printf '\n===== %s =====\n' "$*"; }
 
 h "Containers"
@@ -67,14 +68,50 @@ sql "SELECT a.\"ownerId\" AS owner, encode(a.checksum, 'base64') AS checksum, co
 h "Database: count of such duplicates"
 sql "SELECT count(*) AS duplicate_groups FROM (SELECT 1 FROM $T GROUP BY \"ownerId\", checksum HAVING count(*) > 1) d;"
 
-if [ -n "$SUM" ]; then
-  if [[ "$SUM" =~ ^[A-Za-z0-9+/]+=*$ ]]; then
-    h "Database: assets with checksum $SUM"
-    sql "SELECT $COLS, a.\"ownerId\" AS owner FROM $T a WHERE a.checksum = decode('$SUM', 'base64');"
-  else
-    echo "That doesn't look like a base64 checksum: $SUM"
-  fi
+# album tables and their link columns (names changed across versions)
+AL="$(docker exec -i "$PG" psql -U "$DBU" -d "$DBN" -X -tA \
+      -c "SELECT coalesce(to_regclass('public.album')::text, to_regclass('public.albums')::text)" 2>/dev/null | tr -d '[:space:]')"
+AA="$(docker exec -i "$PG" psql -U "$DBU" -d "$DBN" -X -tA \
+      -c "SELECT coalesce(to_regclass('public.album_asset')::text, to_regclass('public.albums_assets_assets')::text)" 2>/dev/null | tr -d '[:space:]')"
+col() {  # column of table $1 whose name contains $2 and ends in "Id"
+  docker exec -i "$PG" psql -U "$DBU" -d "$DBN" -X -tA -c "SELECT column_name FROM information_schema.columns
+    WHERE table_name = '$1' AND column_name ILIKE '%$2%id' ORDER BY length(column_name) LIMIT 1" 2>/dev/null | tr -d '[:space:]'
+}
+if [ -n "$AL" ] && [ -n "$AA" ]; then
+  AA_AS="$(col "$AA" asset)"; AA_AL="$(col "$AA" album)"
+  h "Database: photos in albums that aren't plain timeline photos"
+  sql "SELECT coalesce(to_jsonb(a)->>'visibility','?') AS visibility, coalesce(to_jsonb(a)->>'status','?') AS status,
+              (to_jsonb(a)->>'deletedAt' IS NOT NULL) AS in_trash, (a.\"ownerId\" <> al.\"ownerId\") AS other_users_photo,
+              count(*) AS album_links
+       FROM $AA x JOIN $T a ON a.id = x.\"$AA_AS\" JOIN $AL al ON al.id = x.\"$AA_AL\"
+       GROUP BY 1, 2, 3, 4 ORDER BY 5 DESC;"
 fi
+
+for ARG in "${ARGS[@]}"; do
+  if [[ "$ARG" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+    h "Database: $ARG as a photo"
+    sql "SELECT $COLS, a.\"ownerId\" AS owner, to_jsonb(a)->>'livePhotoVideoId' AS live_video,
+                to_jsonb(a)->>'stackId' AS stack FROM $T a WHERE a.id = '$ARG';"
+    sql "SELECT id AS is_live_photo_video_of FROM $T WHERE to_jsonb($T)->>'livePhotoVideoId' = '$ARG';"
+    if [ -n "$AL" ]; then
+      h "Database: $ARG as an album"
+      sql "SELECT al.id, to_jsonb(al)->>'albumName' AS name, al.\"ownerId\" AS owner,
+                  to_jsonb(al)->>'deletedAt' AS deleted, to_jsonb(al)->>'updatedAt' AS updated
+           FROM $AL al WHERE al.id = '$ARG';"
+    fi
+    if [ -n "$AA" ]; then
+      h "Database: album links of $ARG"
+      sql "SELECT x.\"$AA_AL\" AS album, x.\"$AA_AS\" AS photo FROM $AA x
+           WHERE x.\"$AA_AL\" = '$ARG' OR x.\"$AA_AS\" = '$ARG' LIMIT 5;"
+      sql "SELECT count(*) AS links FROM $AA x WHERE x.\"$AA_AL\" = '$ARG' OR x.\"$AA_AS\" = '$ARG';"
+    fi
+  elif [[ "$ARG" =~ ^[A-Za-z0-9+/]+=*$ ]]; then
+    h "Database: assets with checksum $ARG"
+    sql "SELECT $COLS, a.\"ownerId\" AS owner FROM $T a WHERE a.checksum = decode('$ARG', 'base64');"
+  else
+    echo "Skipped, neither an id nor a checksum: $ARG"
+  fi
+done
 
 echo
 echo "Nothing was changed. Paste everything above to Claude."
