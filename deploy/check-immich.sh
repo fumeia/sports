@@ -79,7 +79,7 @@ col() {  # column of table $1 whose name contains $2 and ends in "Id"
 }
 if [ -n "$AL" ] && [ -n "$AA" ]; then
   AA_AS="$(col "$AA" asset)"; AA_AL="$(col "$AA" album)"
-  h "Database: photos in albums, by kind (the phone skips hidden, locked and other users' photos)"
+  h "Database: photos in albums, by kind"
   sql "SELECT coalesce(to_jsonb(a)->>'visibility','?') AS visibility, coalesce(to_jsonb(a)->>'status','?') AS status,
               (to_jsonb(a)->>'deletedAt' IS NOT NULL) AS in_trash, (a.\"ownerId\" <> al.\"ownerId\") AS other_users_photo,
               count(*) AS album_links
