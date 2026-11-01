@@ -81,10 +81,9 @@ if [ -n "$AL" ] && [ -n "$AA" ]; then
   AA_AS="$(col "$AA" asset)"; AA_AL="$(col "$AA" album)"
   h "Database: photos in albums, by kind"
   sql "SELECT coalesce(to_jsonb(a)->>'visibility','?') AS visibility, coalesce(to_jsonb(a)->>'status','?') AS status,
-              (to_jsonb(a)->>'deletedAt' IS NOT NULL) AS in_trash, (a.\"ownerId\" <> al.\"ownerId\") AS other_users_photo,
-              count(*) AS album_links
+              (to_jsonb(a)->>'deletedAt' IS NOT NULL) AS in_trash, count(*) AS album_links
        FROM $AA x JOIN $T a ON a.id = x.\"$AA_AS\" JOIN $AL al ON al.id = x.\"$AA_AL\"
-       GROUP BY 1, 2, 3, 4 ORDER BY 5 DESC;"
+       GROUP BY 1, 2, 3 ORDER BY 4 DESC;"
 fi
 
 for ARG in "${ARGS[@]}"; do
@@ -95,9 +94,13 @@ for ARG in "${ARGS[@]}"; do
     sql "SELECT id AS is_live_photo_video_of FROM $T WHERE to_jsonb($T)->>'livePhotoVideoId' = '$ARG';"
     if [ -n "$AL" ]; then
       h "Database: $ARG as an album"
-      sql "SELECT al.id, to_jsonb(al)->>'albumName' AS name, al.\"ownerId\" AS owner,
-                  to_jsonb(al)->>'deletedAt' AS deleted, to_jsonb(al)->>'updatedAt' AS updated
-           FROM $AL al WHERE al.id = '$ARG';"
+      # every column of the album row except long text, as one line per field
+      sql "SELECT key, left(value, 80) AS value FROM $AL al, jsonb_each_text(to_jsonb(al))
+           WHERE al.id = '$ARG' AND key NOT IN ('description') ORDER BY key;"
+      for au in album_user albums_shared_users_users; do   # owner / shared-with (newer versions)
+        [ "$(docker exec -i "$PG" psql -U "$DBU" -d "$DBN" -X -tA -c "SELECT to_regclass('public.$au') IS NOT NULL" 2>/dev/null | tr -d '[:space:]')" = t ] || continue
+        sql "SELECT to_jsonb(x) - 'createId' - 'updateId' AS \"$au\" FROM $au x WHERE to_jsonb(x)::text LIKE '%$ARG%';"
+      done
     fi
     if [ -n "$AA" ]; then
       h "Database: album links of $ARG"
