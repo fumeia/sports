@@ -463,7 +463,6 @@ function openSheet(it) {
   const body = $("#sheet-body");
   let status = label;
   if (it.kind === "queued" && it.enroll_start) status = `Enrollment opens ${shortDate(it.enroll_start)} (in ${countdown(it.enroll_start)})`;
-  if (it.kind === "queued" && it.watch_after) status += ". If it's full then, the bot waits for a free spot";
   if (it.kind === "planned") status = "Every week — the bot queues this date about a week before"
     + (it.enroll_start ? `; enrollment opens ${shortDate(it.enroll_start)}` : "");
   if (it.kind === "signed" && it.place) status = `Signed up · place ${it.place}`;

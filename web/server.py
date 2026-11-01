@@ -76,7 +76,7 @@ COOKIE = "vb_session"
 SPORTS_TTL = 3600
 OFFERS_TTL = 600
 LOOP_SECONDS = 15
-REPAIR_WINDOW = int(os.environ.get("VB_TEST_REPAIR_WINDOW", 15 * 60))
+REPAIR_WINDOW = 15 * 60
 
 sys.path.insert(0, HERE)
 import asvz_plan as plan  # noqa: E402  (copy of the desktop app's module)
@@ -298,102 +298,8 @@ def change_now(fn):
         before = plan.load_schedule()
         started = time.time()
         result = fn()
-        race_first()
         _after_change(before, started)
         return result
-
-
-# "If full, wait for a spot" jobs: the bot hands them to its watcher at
-# run_at (17 min before enrollment opens). The watcher only tells "Ausgebucht"
-# from anything else, so before the opening it keeps trying to click (errors
-# every 30 s), and once you're in, the same #btnRegister is "Einschreibung
-# entfernen": a click signs you out again. So such a date first races the
-# opening as a normal job; only if that clearly didn't get you a place
-# (full / missed) does it get a watch job, which then starts right away.
-WATCH_AFTER_GIVE_UP = 2 * 3600 * 1000     # gone without a result for this long: drop
-
-
-def race_first():
-    """Turns watch jobs whose enrollment isn't open yet into normal jobs
-    and remembers them in week.WATCH_AFTER. Caller holds WRITE_LOCK."""
-    now = datetime.now()
-    with plan.schedule_lock():
-        jobs, moved = plan.load_schedule(), {}
-        for j in jobs:
-            if j.get("watch_free_slot") and datetime.fromisoformat(j["enrollment_start"]) > now:
-                moved[str(j["lesson_id"])] = dict(j)
-                j["watch_free_slot"] = False
-        if not moved:
-            return
-        plan.save_schedule(jobs)
-
-    def go(w):
-        for lid, j in moved.items():
-            w["lessons"][lid] = {"job": j, "seen": int(time.time() * 1000)}
-    week.WATCH_AFTER.update(go)
-    log.info(f"Wait-if-full dates race the opening first: {', '.join(moved)}")
-
-
-def forget_watch_after(lesson_ids):
-    ids = {str(i) for i in lesson_ids}
-
-    def go(w):
-        for lid in ids & w["lessons"].keys():
-            del w["lessons"][lid]
-    week.WATCH_AFTER.update(go)
-
-
-def hand_off_watchers():
-    """Started while the bot is idle. A remembered date whose race job is
-    gone gets its watch job once the bot's log says that race ended full or
-    missed (a result logged after we last saw the job queued, i.e. from the
-    run that removed it). Signed up, lesson started, or no result: dropped."""
-    w = week.WATCH_AFTER.load()["lessons"]
-    if not w:
-        return 0
-    jobs = plan.load_schedule()
-    queued = {str(j.get("lesson_id")) for j in jobs}
-    hist = week.HISTORY.load()["lessons"]
-    now, now_ms = datetime.now(), int(time.time() * 1000)
-    seen, drop, start = [], [], []
-    for lid, e in w.items():
-        h = hist.get(lid, {})
-        fresh = h.get("t", 0) > e["seen"]
-        if lid in queued:
-            seen.append(lid)
-        elif datetime.fromisoformat(e["job"]["lesson_start"]) <= now:
-            drop.append(lid)
-        elif fresh and h.get("status") in ("full", "missed"):
-            start.append(lid)
-        elif (fresh and h.get("status") in ("signed", "watch_ok", "watching")) \
-                or now_ms - e["seen"] > WATCH_AFTER_GIVE_UP:
-            drop.append(lid)
-    if start:
-        def add():
-            with plan.schedule_lock():
-                cur = plan.load_schedule()
-                have = {str(j.get("lesson_id")) for j in cur}
-                next_id = max((j["id"] for j in cur), default=0) + 1
-                stamp = datetime.now().isoformat(timespec="minutes")
-                for lid in start:
-                    if lid in have:
-                        continue
-                    j = w[lid]["job"]   # opening time <= now, so race_first() leaves it alone
-                    cur.append(dict(j, id=next_id, watch_free_slot=True, run_at=stamp, created_at=stamp,
-                                    enrollment_start=min(j["enrollment_start"], stamp)))
-                    next_id += 1
-                plan.save_schedule(cur)
-        change_now(add)
-        log.info(f"Full at opening, now waiting for a free spot: {', '.join(start)}")
-
-    def go(data):
-        for lid in seen:
-            if lid in data["lessons"]:
-                data["lessons"][lid]["seen"] = now_ms
-        for lid in drop + start:
-            data["lessons"].pop(lid, None)
-    week.WATCH_AFTER.update(go)
-    return len(start)
 
 
 def change(label, fn):
@@ -471,11 +377,6 @@ def background_loop():
                     n = change_now(plan.sync)
                     if n:
                         log.info(f"Weekly plan: queued {n} new date(s).")
-                        kick_scheduler()
-                if not scheduler_runs():
-                    if any(j.get("watch_free_slot") for j in plan.load_schedule()):
-                        change_now(lambda: None)      # race_first() runs in there
-                    if hand_off_watchers():
                         kick_scheduler()
         except Exception:
             log.exception("Background loop")
@@ -1110,17 +1011,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 e["watch"] = watch
                 plan.save_plan(p)
                 jobs, n = plan.load_schedule(), 0
-                later = week.WATCH_AFTER.load()["lessons"]
-                mine = [j for j in jobs if j.get("offer_key") == key]
-                for j in mine:
-                    if (bool(j.get("watch_free_slot")) or str(j["lesson_id"]) in later) != watch:
+                for j in jobs:
+                    if j.get("offer_key") == key and bool(j.get("watch_free_slot")) != watch:
+                        j["watch_free_slot"] = watch
                         n += 1
-                    j["watch_free_slot"] = watch
-                if mine:
+                if n:
                     plan.save_schedule(jobs)
-            if not watch:
-                forget_watch_after(j["lesson_id"] for j in mine)
-            return n
+                return n
         applied, n = change("Wait if full " + ("on" if watch else "off"), go)
         return self._changed(applied, ("Waits for a spot if full" if watch else "Won't wait if full")
                              + (f" · {n} queued date{'s' if n != 1 else ''} updated" if n else ""))
@@ -1141,8 +1038,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     raise ApiError(404, "That date isn't queued anymore")
                 job["watch_free_slot"] = watch
                 plan.save_schedule(jobs)
-            if not watch:
-                forget_watch_after([job["lesson_id"]])
         applied, _ = change("Wait if full " + ("on" if watch else "off") + " (one date)", go)
         return self._changed(applied, "Waits for a spot if full" if watch else "Won't wait if full")
 
