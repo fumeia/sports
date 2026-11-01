@@ -355,14 +355,45 @@ def sync_due():
     return not last or datetime.now() - datetime.fromisoformat(last) >= plan.SYNC_INTERVAL
 
 
+def restore_watch_jobs():
+    """One-time cleanup: an earlier version queued "wait if full" dates as
+    normal jobs and kept the setting in watch_after.json. Gives the dates
+    still queued their setting back, then moves the file aside."""
+    path = os.path.join(DATA_DIR, "watch_after.json")
+    if not os.path.exists(path):
+        return True
+    if scheduler_runs():
+        return False
+    with open(path, encoding="utf-8") as f:
+        ids = set(json.load(f).get("lessons", {}))
+
+    def go():
+        with plan.schedule_lock():
+            jobs, n = plan.load_schedule(), 0
+            for j in jobs:
+                if str(j.get("lesson_id")) in ids and not j.get("watch_free_slot"):
+                    j["watch_free_slot"] = True
+                    n += 1
+            if n:
+                plan.save_schedule(jobs)
+            return n
+    n = change_now(go)
+    os.replace(path, path + ".restored-" + time.strftime("%Y%m%d-%H%M%S"))
+    log.info(f"Wait-if-full restored on {n} queued date(s).")
+    return True
+
+
 def background_loop():
     """Every LOOP_SECONDS, while the bot is idle: apply queued changes,
     repair, queue newly published weekly dates (throttled to 30 min
     inside asvz_plan.sync)."""
+    restored = False
     while True:
         time.sleep(LOOP_SECONDS)
         try:
             with WRITE_LOCK:
+                if not restored:
+                    restored = restore_watch_jobs()
                 if scheduler_runs():
                     continue
                 repair()

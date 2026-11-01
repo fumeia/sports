@@ -21,6 +21,16 @@ if curl -fsSL -o "$T/srv.zip" https://github.com/fumeia/sports/releases/download
   rel="$(find "$T/srv" -name asvz_scheduler.py | head -1)"
   diff -u "$rel" "$BOT_DIR/asvz_scheduler.py" | sed -E 's/((-p|--password)[ =])[^ ]+/\1***/g' | head -400
   echo "(end of diff)"
+  for f in asvz_bot.py slot_watcher.py; do
+    h "$f: release vs. $BOT_DIR"
+    r="$(find "$T/srv" -name "$f" | head -1)"
+    if [ -f "$BOT_DIR/$f" ] && [ -n "$r" ]; then
+      diff -u "$r" "$BOT_DIR/$f" | sed -E 's/((-p|--password)[ =])[^ ]+/\1***/g' | head -400
+      echo "(end of diff)"
+    else
+      echo "not found"
+    fi
+  done
 else
   echo "Could not download the release zip."
 fi
